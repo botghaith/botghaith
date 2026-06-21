@@ -1,0 +1,34 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+TEMP_DIR = Path(os.getenv("TEMP_DIR", DATA_DIR / "temp"))
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "bot.db"))
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "qhaith").lstrip("@").lower()
+
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
+CHANNEL_REQUIRED = os.getenv("CHANNEL_REQUIRED", "1") == "1"
+
+WELCOME_MESSAGE = """مرحباً بك! 👋
+
+🎓 **بوت تعليمي متكامل لطلاب الجامعات**
+من إعداد **المهندس غيث اسعد**
+
+اختر القسم الذي تريده من القائمة أدناه:
+
+📚 الترجمة — نصوص وملفات
+📄 أدوات PDF والملفات
+📝 الامتحانات الإلكترونية
+🧑‍🎓 حسابي الطلابي
+
+جميع الأدوات تعمل **محلياً ومجاناً**."""
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
