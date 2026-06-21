@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # بوت تيليجرام تعليمي متكامل لطلاب الجامعات
 # من إعداد المهندس غيث اسعد
 
@@ -115,3 +116,21 @@ bot1/
 ---
 
 **من إعداد المهندس غيث اسعد**
+=======
+## Hi there 👋
+
+<!--
+**botghaith/botghaith** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+
+Here are some ideas to get you started:
+
+- 🔭 I’m currently working on ...
+- 🌱 I’m currently learning ...
+- 👯 I’m looking to collaborate on ...
+- 🤔 I’m looking for help with ...
+- 💬 Ask me about ...
+- 📫 How to reach me: ...
+- 😄 Pronouns: ...
+- ⚡ Fun fact: ...
+-->
+>>>>>>> 677b80e2cc5d016ca2285fba60034ef4f7844959
