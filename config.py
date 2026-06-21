@@ -12,7 +12,7 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "bot.db"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "qhaith").lstrip("@").lower()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://qusavnejgrcxuuyunrry.supabase.co")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 SUPABASE_JWKS_URL = os.getenv("SUPABASE_JWKS_URL", "")

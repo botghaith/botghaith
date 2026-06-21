@@ -5,7 +5,10 @@
 """
 
 import logging
+import os
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram.ext import Application
 
@@ -24,6 +27,24 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def start_health_server() -> None:
+    """Render Web Service يحتاج process يستمع على PORT."""
+    port = int(os.environ.get("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running")
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info("Health server listening on port %s", port)
 
 
 def create_application(db) -> Application:
@@ -71,6 +92,7 @@ def main() -> None:
 
     db = get_database()
     install_translation_packages()
+    start_health_server()
 
     app = create_application(db)
     backend = "Supabase" if is_supabase_enabled() else "SQLite"
