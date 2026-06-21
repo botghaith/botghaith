@@ -68,8 +68,17 @@ def main() -> None:
         app.add_handler(handler)
 
     logger.info("🎓 البوت التعليمي يعمل الآن — إعداد المهندس غيث اسعد")
-    app.run_polling(drop_pending_updates=True)
+    import asyncio
 
+async def run():
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.idle()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
+
+
+
