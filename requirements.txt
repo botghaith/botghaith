@@ -10,3 +10,4 @@ aiofiles==24.1.0
 arabic-reshaper==3.0.0
 python-bidi==0.4.2
 pytesseract==0.3.13
+supabase>=2.16.0

@@ -24,3 +24,9 @@ services:
         value: https://t.me/mcqthr
       - key: CHANNEL_REQUIRED
         value: "1"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false

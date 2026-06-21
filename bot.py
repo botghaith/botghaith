@@ -9,8 +9,8 @@ import sys
 
 from telegram.ext import Application
 
-from config import BOT_TOKEN
-from database.db import Database
+from config import BOT_TOKEN, is_supabase_enabled
+from database import get_database
 from handlers.admin import setup_admin_handlers
 from handlers.exams import setup_exam_handlers
 from handlers.pdf_tools import setup_pdf_handlers
@@ -26,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def create_application(db: Database) -> Application:
+def create_application(db) -> Application:
     """إنشاء التطبيق وتسجيل جميع المعالجات."""
     start_handlers, back_to_main = setup_start_handlers(db)
 
@@ -69,11 +69,12 @@ def main() -> None:
         logger.error("BOT_TOKEN غير موجود! أضفه في Environment Variables (Render) أو ملف .env")
         sys.exit(1)
 
-    db = Database()
+    db = get_database()
     install_translation_packages()
 
     app = create_application(db)
-    logger.info("🎓 البوت التعليمي يعمل الآن — إعداد المهندس غيث اسعد")
+    backend = "Supabase" if is_supabase_enabled() else "SQLite"
+    logger.info("🎓 البوت التعليمي يعمل الآن (%s) — إعداد المهندس غيث اسعد", backend)
     app.run_polling(drop_pending_updates=True)
 
 

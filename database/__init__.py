@@ -1,3 +1,9 @@
-from .db import Database
+from config import is_supabase_enabled
 
-__all__ = ["Database"]
+
+def get_database():
+    if is_supabase_enabled():
+        from database.supabase_db import SupabaseDatabase
+        return SupabaseDatabase()
+    from database.db import Database
+    return Database()
