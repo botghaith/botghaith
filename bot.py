@@ -11,12 +11,12 @@ from telegram.ext import Application
 
 from config import BOT_TOKEN
 from database.db import Database
-from handlers.start import setup_start_handlers
-from handlers.translation import setup_translation_handlers
-from handlers.pdf_tools import setup_pdf_handlers
-from handlers.exams import setup_exam_handlers
-from handlers.student import setup_student_handlers
 from handlers.admin import setup_admin_handlers
+from handlers.exams import setup_exam_handlers
+from handlers.pdf_tools import setup_pdf_handlers
+from handlers.start import setup_start_handlers
+from handlers.student import setup_student_handlers
+from handlers.translation import setup_translation_handlers
 from setup_translate import install_translation_packages
 
 logging.basicConfig(
@@ -26,14 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN غير موجود! أنشئ ملف .env")
-        sys.exit(1)
-
-    db = Database()
-    install_translation_packages()
-
+def create_application(db: Database) -> Application:
+    """إنشاء التطبيق وتسجيل جميع المعالجات."""
     start_handlers, back_to_main = setup_start_handlers(db)
 
     app = (
@@ -67,18 +61,21 @@ def main() -> None:
     for handler in setup_admin_handlers(db, back_to_main):
         app.add_handler(handler)
 
-    logger.info("🎓 البوت التعليمي يعمل الآن — إعداد المهندس غيث اسعد")
-    import asyncio
+    return app
 
-async def run():
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        await app.updater.idle()
+
+def main() -> None:
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN غير موجود! أضفه في Environment Variables (Render) أو ملف .env")
+        sys.exit(1)
+
+    db = Database()
+    install_translation_packages()
+
+    app = create_application(db)
+    logger.info("🎓 البوت التعليمي يعمل الآن — إعداد المهندس غيث اسعد")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    asyncio.run(run())
-
-
-
+    main()

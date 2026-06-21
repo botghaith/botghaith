@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: helpsmart3-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_USERNAME
+        value: qhaith
+      - key: DATABASE_PATH
+        value: data/bot.db
+      - key: TEMP_DIR
+        value: data/temp
+      - key: CHANNEL_USERNAME
+        value: mcqthr
+      - key: CHANNEL_LINK
+        value: https://t.me/mcqthr
+      - key: CHANNEL_REQUIRED
+        value: "1"
