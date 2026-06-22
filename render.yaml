@@ -26,5 +26,7 @@ services:
         value: "1"
       - key: SUPABASE_URL
         value: https://qusavnejgrcxuuyunrry.supabase.co
+      - key: ARGOS_PACKAGES_DIR
+        value: data/argos-packages
       - key: SUPABASE_SECRET_KEY
         sync: false

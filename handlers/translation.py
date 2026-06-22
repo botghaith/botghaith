@@ -132,17 +132,8 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             "⏳ جاري الترجمة..."
         )
 
-        async def _wait_translator() -> bool:
-            for _ in range(60):
-                if await asyncio.to_thread(is_translator_ready):
-                    return True
-                await asyncio.sleep(2)
-            return False
-
         async def _job():
             try:
-                if not await _wait_translator():
-                    raise RuntimeError("محرك الترجمة لم يكتمل تحميله — حاول بعد دقيقة")
                 interleaved, full_tr = await asyncio.wait_for(
                     asyncio.to_thread(translate_text_dual, text, actual_dir),
                     timeout=180.0,

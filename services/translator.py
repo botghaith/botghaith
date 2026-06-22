@@ -1,7 +1,12 @@
 import html
+import json
 import logging
 import re
 import threading
+import urllib.parse
+import urllib.request
+
+import config  # noqa: F401 — ARGOS_PACKAGES_DIR قبل argostranslate
 
 logger = logging.getLogger(__name__)
 
@@ -126,20 +131,44 @@ def split_units(text: str) -> list[str]:
     return result
 
 
+def _online_translate(text: str, direction: str) -> str:
+    langpair = "ar|en" if direction == "ar_en" else "en|ar"
+    url = (
+        "https://api.mymemory.translated.net/get?q="
+        + urllib.parse.quote(text[:5000])
+        + f"&langpair={langpair}"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "botghaith/1.0"})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        data = json.loads(resp.read().decode())
+    translated = (data.get("responseData") or {}).get("translatedText", "").strip()
+    if not translated:
+        raise RuntimeError("فشلت الترجمة عبر الإنترنت")
+    return translated
+
+
 def translate_text(text: str, direction: str = "en_ar") -> str:
     text = (text or "").strip()
     if not text:
         return ""
     direction = resolve_direction(text, direction)
-    if not _ensure_translator():
-        return _fallback_translate(text, direction)
+    if _ensure_translator():
+        try:
+            engine = _ar_en if direction == "ar_en" else _en_ar
+            chunks = _chunk_text(text)
+            return "\n".join(engine.translate(c) for c in chunks).strip()
+        except Exception as e:
+            logger.warning("Argos translation failed, trying online: %s", e)
 
     try:
-        engine = _ar_en if direction == "ar_en" else _en_ar
-        chunks = _chunk_text(text)
-        return "\n".join(engine.translate(c) for c in chunks).strip()
+        if len(text) <= 450:
+            return _online_translate(text, direction)
+        parts = []
+        for chunk in _chunk_text(text):
+            parts.append(_online_translate(chunk, direction))
+        return "\n".join(parts).strip()
     except Exception as e:
-        logger.error(f"Translation error: {e}")
+        logger.error("Online translation error: %s", e)
         return _fallback_translate(text, direction)
 
 
@@ -191,8 +220,6 @@ def translate_interleaved(text: str, direction: str = "en_ar") -> str:
 def translate_text_dual(text: str, direction: str = "auto") -> tuple[str, str]:
     """ترجمة واحدة للنص — عرض ثنائي + نص كامل."""
     direction = resolve_direction(text, direction)
-    if not _ensure_translator():
-        raise RuntimeError("محرك الترجمة غير جاهز على السيرفر")
     pairs = [(unit, translate_text(unit, direction)) for unit in split_units(text)]
     interleaved = "\n\n".join(
         f"<b>{_esc(src)}</b>\n<i>{_esc(tr)}</i>" for src, tr in pairs

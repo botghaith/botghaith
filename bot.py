@@ -10,6 +10,7 @@ import sys
 
 from telegram.ext import Application
 
+import config  # noqa: F401 — ARGOS_PACKAGES_DIR
 from config import BOT_TOKEN, is_supabase_enabled
 from database import get_database
 from handlers.admin import setup_admin_handlers

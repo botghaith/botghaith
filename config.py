@@ -41,3 +41,7 @@ WELCOME_MESSAGE = """مرحباً بك! 👋
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+ARGOS_PACKAGES_DIR = Path(os.getenv("ARGOS_PACKAGES_DIR", DATA_DIR / "argos-packages"))
+ARGOS_PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+os.environ["ARGOS_PACKAGES_DIR"] = str(ARGOS_PACKAGES_DIR.resolve())

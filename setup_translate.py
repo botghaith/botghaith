@@ -1,6 +1,8 @@
 """تحميل حزم الترجمة المحلية عند أول تشغيل"""
 import logging
 
+import config  # noqa: F401 — يضبط ARGOS_PACKAGES_DIR قبل argostranslate
+
 logger = logging.getLogger(__name__)
 
 
@@ -14,7 +16,7 @@ def install_translation_packages():
         has_en_ar = any(p.from_code == "en" and p.to_code == "ar" for p in installed)
 
         if has_ar_en and has_en_ar:
-            logger.info("حزم الترجمة مثبتة مسبقاً")
+            logger.info("حزم الترجمة مثبتة مسبقاً في %s", config.ARGOS_PACKAGES_DIR)
             return
 
         logger.info("جاري تحميل حزم الترجمة (أول مرة فقط)...")
