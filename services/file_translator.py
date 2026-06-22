@@ -37,7 +37,7 @@ MAX_FILE_MB = 50
 WORD_TOKEN_RE = re.compile(r"\S+")
 WORD_CHAR_RE = re.compile(r"[\w\u0600-\u06FF]", re.UNICODE)
 _word_cache: dict[tuple[str, str], str] = {}
-_WORD_BATCH_SIZE = 15
+_WORD_BATCH_SIZE = 25
 
 
 def _clear_word_cache():
@@ -837,20 +837,27 @@ def translate_image_two_modes(
         raise ValueError("لم يتم العثور على نص في الصورة")
     _check_file_limits(image_path, content)
     direction = resolve_direction(content, direction)
+    logger.info("Full image translation (4 files): %s", image_path.name)
+    logger.info("Step 0/4: prewarming word cache...")
     _prewarm_word_cache_for_text(content, direction)
 
+    logger.info("Step 1/4: literal PDF...")
     result = _build_literal_files(content, direction, output_dir, stem)
 
+    logger.info("Step 2/4: structured PDF...")
     structured_pdf = output_dir / f"{stem}_2_بنفس_الترتيب.pdf"
     _translate_image_structured(image_path, layout, structured_pdf, direction, content)
     result["structured"] = structured_pdf
 
+    logger.info("Step 3/4: line pairs...")
     result.update(_build_line_pairs_file(content, direction, output_dir, stem))
 
+    logger.info("Step 4/4: overlay...")
     overlay_pdf = output_dir / f"{stem}_4_فوق_الكلمات.pdf"
     _translate_image_overlay(image_path, layout, overlay_pdf, direction, content)
     result["overlay"] = overlay_pdf
 
+    logger.info("Full image translation done")
     return result
 
 
@@ -869,8 +876,11 @@ def translate_file_two_modes(
     if not sample.strip():
         raise ValueError("لم يتم العثور على نص في الملف")
     direction = resolve_direction(sample, direction)
+    logger.info("Full translation (4 files): %s", source_path.name)
+    logger.info("Step 0/4: prewarming word cache...")
     _prewarm_word_cache_for_text(sample, direction)
 
+    logger.info("Step 1-2/4: literal + structured...")
     if suffix in (".docx", ".doc"):
         result = _translate_docx(source_path, output_dir, stem, direction)
     elif suffix == ".pdf":
@@ -880,8 +890,11 @@ def translate_file_two_modes(
     else:
         raise ValueError(f"نوع الملف غير مدعوم: {suffix}")
 
+    logger.info("Step 3/4: line pairs...")
     result.update(_build_line_pairs_file(sample, direction, output_dir, stem))
+    logger.info("Step 4/4: overlay...")
     result.update(_build_overlay_file(source_path, output_dir, stem, direction, sample))
+    logger.info("Full translation done: %s", list(result.keys()))
     return result
 
 

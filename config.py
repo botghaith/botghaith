@@ -30,12 +30,8 @@ def use_online_translate() -> bool:
 
 
 def use_fast_file_translation() -> bool:
-    """على Render: ترجمة فقرات فقط (سريعة). محلياً: 4 صيغ كاملة."""
-    if os.getenv("FILE_TRANSLATE_FULL", "") == "1":
-        return False
-    if os.getenv("FILE_TRANSLATE_FAST", "") == "1":
-        return True
-    return bool(os.getenv("RENDER"))
+    """الوضع السريع (ملفان فقط) — اختياري. الافتراضي: 4 ملفات كاملة."""
+    return os.getenv("FILE_TRANSLATE_FAST", "") == "1"
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
