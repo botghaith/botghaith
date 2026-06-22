@@ -179,20 +179,26 @@ def _google_translate(text: str, direction: str) -> str:
     return GoogleTranslator(source=src, target=tgt).translate(text)
 
 
+def _provider_name(fn) -> str:
+    return fn.__name__.removeprefix("_").removesuffix("_translate")
+
+
 def _online_translate(text: str, direction: str) -> str:
     text = (text or "").strip()
     if not text:
         return ""
     errors: list[str] = []
+    unchanged_results: list[str] = []
     providers = (_lingva_translate, _google_translate, _mymemory_translate)
     for fn in providers:
-        name = fn.__name__.replace("_translate", "")
+        name = _provider_name(fn)
         try:
             result = fn(text, direction).strip()
             if not result:
                 errors.append(f"{name}: empty result")
                 continue
             if result.upper() == text.upper():
+                unchanged_results.append(result)
                 errors.append(f"{name}: unchanged text")
                 continue
             if "MYMEMORY WARNING" in result.upper():
@@ -203,6 +209,12 @@ def _online_translate(text: str, direction: str) -> str:
         except Exception as e:
             errors.append(f"{name}: {e}")
             logger.warning("Translation provider %s failed: %s", name, e)
+
+    # أسماء وأرقام وعلامات — المزودات ترجعها كما هي (ليست فشلاً)
+    if unchanged_results:
+        logger.debug("Keeping original text (providers returned unchanged): %r", text[:80])
+        return text
+
     raise RuntimeError("فشلت الترجمة: " + (errors[-1] if errors else "لا توجد خدمة متاحة"))
 
 
@@ -221,9 +233,16 @@ def _mymemory_translate(text: str, direction: str) -> str:
 
 
 def _online_translate_long(text: str, direction: str) -> str:
-    if len(text) <= 450:
+    if len(text) <= CHUNK_SIZE:
         return _online_translate(text, direction)
-    return "\n".join(_online_translate(c, direction) for c in _chunk_text(text)).strip()
+    parts = []
+    for chunk in _chunk_text(text):
+        try:
+            parts.append(_online_translate(chunk, direction))
+        except Exception as e:
+            logger.warning("Chunk translation failed (%r), keeping original: %s", chunk[:40], e)
+            parts.append(chunk)
+    return "\n".join(parts).strip()
 
 
 def translate_text(text: str, direction: str = "en_ar") -> str:
