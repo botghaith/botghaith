@@ -26,3 +26,8 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node (not used by bot)
+node_modules/
+package-lock.json
+

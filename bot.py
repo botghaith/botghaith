@@ -6,8 +6,10 @@
 
 import asyncio
 import logging
+import os
 import sys
 
+from telegram.error import Conflict
 from telegram.ext import Application
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR
@@ -51,7 +53,14 @@ def create_application(db) -> Application:
     )
 
     async def on_error(update, context):
-        logger.exception("Unhandled error: %s", context.error)
+        err = context.error
+        if isinstance(err, Conflict):
+            logger.error(
+                "409 Conflict: البوت يعمل في مكانين (Render + جهازك). "
+                "أوقف أحدهما — Render للتشغيل الدائم، أو جهازك للتجربة فقط."
+            )
+            return
+        logger.exception("Unhandled error: %s", err)
 
     app.add_error_handler(on_error)
 
@@ -82,7 +91,8 @@ def main() -> None:
 
     app = create_application(db)
     backend = "Supabase" if is_supabase_enabled() else "SQLite"
-    logger.info("🎓 البوت التعليمي يعمل الآن (%s) — إعداد المهندس غيث اسعد", backend)
+    host = "Render (24/7)" if os.getenv("RENDER") else "Local (جهازك)"
+    logger.info("🎓 البوت يعمل — %s | %s | إعداد المهندس غيث اسعد", host, backend)
     app.run_polling(drop_pending_updates=True)
 
 

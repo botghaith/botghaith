@@ -3,6 +3,7 @@ services:
     name: helpsmart3-bot
     runtime: python
     plan: starter
+    autoDeploy: true
     repo: https://github.com/botghaith/botghaith
     branch: main
     buildCommand: python --version && pip install -r requirements.txt && python setup_translate.py
