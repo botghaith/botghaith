@@ -4,6 +4,7 @@
 من إعداد المهندس غيث اسعد
 """
 
+import asyncio
 import logging
 import sys
 
@@ -28,11 +29,18 @@ logger = logging.getLogger(__name__)
 
 def create_application(db) -> Application:
     """إنشاء التطبيق وتسجيل جميع المعالجات."""
+
+    async def post_init(_application: Application) -> None:
+        logger.info("Installing translation packages in background...")
+        await asyncio.to_thread(install_translation_packages)
+        logger.info("Translation packages ready")
+
     start_handlers, back_to_main = setup_start_handlers(db)
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
         .concurrent_updates(True)
         .connect_timeout(120.0)
         .read_timeout(600.0)
@@ -70,8 +78,6 @@ def main() -> None:
         sys.exit(1)
 
     db = get_database()
-    logger.info("Installing translation packages...")
-    install_translation_packages()
 
     app = create_application(db)
     backend = "Supabase" if is_supabase_enabled() else "SQLite"

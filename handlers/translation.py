@@ -49,7 +49,7 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
     async def enter_translation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await check_channel_subscription(update, context, db):
             return ConversationHandler.END
-        ready = "✅ المحرك جاهز" if is_translator_ready() else "⚠️ جاري تحميل محرك الترجمة..."
+        ready = "✅ المحرك جاهز" if is_translator_ready() else "⏳ جاري تحميل محرك الترجمة — انتظر 30 ثانية ثم أرسل النص"
         await update.message.reply_text(
             f"📚 **قسم الترجمة**\n{ready}\n\n"
             "اختر نوع الترجمة:\n"
@@ -132,8 +132,17 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             "⏳ جاري الترجمة..."
         )
 
+        async def _wait_translator() -> bool:
+            for _ in range(60):
+                if await asyncio.to_thread(is_translator_ready):
+                    return True
+                await asyncio.sleep(2)
+            return False
+
         async def _job():
             try:
+                if not await _wait_translator():
+                    raise RuntimeError("محرك الترجمة لم يكتمل تحميله — حاول بعد دقيقة")
                 interleaved, full_tr = await asyncio.wait_for(
                     asyncio.to_thread(translate_text_dual, text, actual_dir),
                     timeout=180.0,
