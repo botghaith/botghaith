@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR قبل argostranslate
+from config import use_online_translate
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ def _online_translate(text: str, direction: str) -> str:
         + f"&langpair={langpair}"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "botghaith/1.0"})
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode())
     translated = (data.get("responseData") or {}).get("translatedText", "").strip()
     if not translated:
@@ -147,11 +148,24 @@ def _online_translate(text: str, direction: str) -> str:
     return translated
 
 
+def _online_translate_long(text: str, direction: str) -> str:
+    if len(text) <= 450:
+        return _online_translate(text, direction)
+    return "\n".join(_online_translate(c, direction) for c in _chunk_text(text)).strip()
+
+
 def translate_text(text: str, direction: str = "en_ar") -> str:
     text = (text or "").strip()
     if not text:
         return ""
     direction = resolve_direction(text, direction)
+
+    if use_online_translate():
+        try:
+            return _online_translate_long(text, direction)
+        except Exception as e:
+            logger.warning("Online translation failed on cloud, trying Argos: %s", e)
+
     if _ensure_translator():
         try:
             engine = _ar_en if direction == "ar_en" else _en_ar
@@ -161,12 +175,7 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
             logger.warning("Argos translation failed, trying online: %s", e)
 
     try:
-        if len(text) <= 450:
-            return _online_translate(text, direction)
-        parts = []
-        for chunk in _chunk_text(text):
-            parts.append(_online_translate(chunk, direction))
-        return "\n".join(parts).strip()
+        return _online_translate_long(text, direction)
     except Exception as e:
         logger.error("Online translation error: %s", e)
         return _fallback_translate(text, direction)

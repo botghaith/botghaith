@@ -21,6 +21,11 @@ SUPABASE_JWKS_URL = os.getenv("SUPABASE_JWKS_URL", "")
 def is_supabase_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
 
+
+def use_online_translate() -> bool:
+    """على Render نستخدم ترجمة أونلاين — أخف وأسرع من Argos."""
+    return os.getenv("RENDER") == "true" or os.getenv("USE_ONLINE_TRANSLATE", "") == "1"
+
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
 CHANNEL_REQUIRED = os.getenv("CHANNEL_REQUIRED", "1") == "1"

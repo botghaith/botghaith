@@ -128,64 +128,50 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
 
-        status = await update.message.reply_text(
-            "⏳ جاري الترجمة..."
-        )
+        status = await update.message.reply_text("⏳ جاري الترجمة...")
 
-        async def _job():
-            try:
-                interleaved, full_tr = await asyncio.wait_for(
-                    asyncio.to_thread(translate_text_dual, text, actual_dir),
-                    timeout=180.0,
-                )
-                header = (
-                    f"✅ تمت الترجمة ({direction_label(actual_dir)})\n"
-                    f"📊 {len(text)} حرف → {len(full_tr)} حرف\n\n"
-                    "📖 العرض الثنائي (أصلي + ترجمة):"
-                )
-                await context.bot.send_message(chat_id, header)
+        try:
+            interleaved, full_tr = await asyncio.wait_for(
+                asyncio.to_thread(translate_text_dual, text, actual_dir),
+                timeout=90.0,
+            )
+            header = (
+                f"✅ تمت الترجمة ({direction_label(actual_dir)})\n"
+                f"📊 {len(text)} حرف → {len(full_tr)} حرف\n\n"
+                "📖 العرض الثنائي (أصلي + ترجمة):"
+            )
+            await update.message.reply_text(header)
 
-                for part in _split_message(interleaved):
-                    try:
-                        await context.bot.send_message(chat_id, part, parse_mode="HTML")
-                    except Exception:
-                        plain = re.sub(r"<[^>]+>", "", part)
-                        await context.bot.send_message(chat_id, plain)
-
-                await context.bot.send_message(
-                    chat_id,
-                    f"📝 الترجمة الكاملة:\n\n{truncate_text(full_tr, 3500)}",
-                    reply_markup=translation_menu(),
-                )
-                db.log_activity(user_id, "translate_text")
-            except asyncio.TimeoutError:
-                await context.bot.send_message(
-                    chat_id,
-                    "❌ انتهت مهلة الترجمة.\n"
-                    "السيرفر مشغول — جرّب نصاً أقصر أو حاول بعد دقيقة.",
-                    reply_markup=translation_menu(),
-                )
-            except RuntimeError as e:
-                await context.bot.send_message(
-                    chat_id,
-                    f"❌ {e}\n"
-                    "أعد تشغيل الخدمة على Render (Manual Deploy) ثم حاول مجدداً.",
-                    reply_markup=translation_menu(),
-                )
-            except Exception as e:
-                logger.error(f"Text translation error: {e}", exc_info=True)
-                await context.bot.send_message(
-                    chat_id,
-                    f"❌ خطأ في ترجمة النص: {e}",
-                    reply_markup=translation_menu(),
-                )
-            finally:
+            for part in _split_message(interleaved):
                 try:
-                    await status.delete()
+                    await context.bot.send_message(chat_id, part, parse_mode="HTML")
                 except Exception:
-                    pass
+                    plain = re.sub(r"<[^>]+>", "", part)
+                    await context.bot.send_message(chat_id, plain)
 
-        spawn_background(_job(), label=f"translate_text:{user_id}")
+            await context.bot.send_message(
+                chat_id,
+                f"📝 الترجمة الكاملة:\n\n{truncate_text(full_tr, 3500)}",
+                reply_markup=translation_menu(),
+            )
+            db.log_activity(user_id, "translate_text")
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                "❌ انتهت مهلة الترجمة — جرّب نصاً أقصر.",
+                reply_markup=translation_menu(),
+            )
+        except Exception as e:
+            logger.error(f"Text translation error: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ خطأ في ترجمة النص: {e}",
+                reply_markup=translation_menu(),
+            )
+        finally:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
         return ConversationHandler.END
 
     async def _send_translation_outputs(context, chat_id: int, outputs: dict, source_label: str):
