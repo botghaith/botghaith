@@ -20,6 +20,13 @@ CHUNK_SIZE = 450
 ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?؟…:;])\s+|\n+")
 
+# خوادم Lingva (مرآة Google Translate) — تعمل جيداً على Render
+LINGVA_INSTANCES = [
+    "https://lingva.ml",
+    "https://lingva.garudalinux.org",
+    "https://translate.plausibility.cloud",
+]
+
 
 def _ensure_translator():
     global _translator_ready, _ar_en, _en_ar
@@ -132,10 +139,43 @@ def split_units(text: str) -> list[str]:
     return result
 
 
+def _lang_codes(direction: str) -> tuple[str, str]:
+    return ("ar", "en") if direction == "ar_en" else ("en", "ar")
+
+
+def _http_get_json(url: str, timeout: float = 25) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; botghaith/1.0)",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _lingva_translate(text: str, direction: str) -> str:
+    src, tgt = _lang_codes(direction)
+    encoded = urllib.parse.quote(text[:5000], safe="")
+    last_err = None
+    for base in LINGVA_INSTANCES:
+        url = f"{base.rstrip('/')}/api/v1/{src}/{tgt}/{encoded}"
+        try:
+            data = _http_get_json(url)
+            translated = (data.get("translation") or "").strip()
+            if translated:
+                return translated
+            last_err = f"{base}: empty response"
+        except Exception as e:
+            last_err = f"{base}: {e}"
+    raise RuntimeError(last_err or "Lingva unavailable")
+
+
 def _google_translate(text: str, direction: str) -> str:
     from deep_translator import GoogleTranslator
 
-    src, tgt = ("ar", "en") if direction == "ar_en" else ("en", "ar")
+    src, tgt = _lang_codes(direction)
     return GoogleTranslator(source=src, target=tgt).translate(text)
 
 
@@ -143,20 +183,26 @@ def _online_translate(text: str, direction: str) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    errors = []
-    for fn in (_google_translate, _mymemory_translate):
+    errors: list[str] = []
+    providers = (_lingva_translate, _google_translate, _mymemory_translate)
+    for fn in providers:
+        name = fn.__name__.replace("_translate", "")
         try:
             result = fn(text, direction).strip()
             if not result:
+                errors.append(f"{name}: empty result")
                 continue
             if result.upper() == text.upper():
+                errors.append(f"{name}: unchanged text")
                 continue
             if "MYMEMORY WARNING" in result.upper():
+                errors.append(f"{name}: rate limited")
                 continue
+            logger.info("Online translation via %s", name)
             return result
         except Exception as e:
-            errors.append(str(e))
-            logger.warning("Translation provider failed: %s", e)
+            errors.append(f"{name}: {e}")
+            logger.warning("Translation provider %s failed: %s", name, e)
     raise RuntimeError("فشلت الترجمة: " + (errors[-1] if errors else "لا توجد خدمة متاحة"))
 
 
@@ -167,9 +213,7 @@ def _mymemory_translate(text: str, direction: str) -> str:
         + urllib.parse.quote(text[:5000])
         + f"&langpair={langpair}"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "botghaith/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode())
+    data = _http_get_json(url, timeout=30)
     translated = (data.get("responseData") or {}).get("translatedText", "").strip()
     if not translated:
         raise RuntimeError("MyMemory returned empty")
@@ -192,7 +236,7 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
         try:
             return _online_translate_long(text, direction)
         except Exception as e:
-            logger.warning("Online translation failed on cloud, trying Argos: %s", e)
+            logger.warning("Online translation failed, trying Argos fallback: %s", e)
 
     if _ensure_translator():
         try:
