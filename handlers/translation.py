@@ -271,7 +271,10 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         )
         try:
             fn = translate_image_two_modes if image else translate_file_two_modes
-            outputs = await asyncio.to_thread(fn, media_path, user_dir, direction)
+            outputs = await asyncio.wait_for(
+                asyncio.to_thread(fn, media_path, user_dir, direction),
+                timeout=1800.0,
+            )
         finally:
             stop_event.set()
             ticker.cancel()
@@ -296,6 +299,16 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             context, chat_id, user_id, file_path, user_dir, direction, status_msg_id,
             image=False, activity="translate_file",
         )
+
+    async def wait_direction_media_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        mode = context.user_data.get("tr_mode", "text")
+        label = {"file": "الملف", "image": "الصورة"}.get(mode, "المرفق")
+        await update.message.reply_text(
+            f"📨 تم استلام {label}.\n"
+            "🌐 اختر اتجاه الترجمة أولاً من الأزرار أدناه:",
+            reply_markup=translation_direction_reply_menu(),
+        )
+        return states.TR_WAIT_DIRECTION
 
     async def translate_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text == "🔙 القائمة الرئيسية":
@@ -347,6 +360,13 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
                     await _translate_file_job(
                         context, chat_id, user_id, file_path,
                         user_dir, direction, status.message_id,
+                    )
+                except asyncio.TimeoutError:
+                    await context.bot.send_message(
+                        chat_id,
+                        "❌ انتهت مهلة ترجمة الملف (30 دقيقة).\n"
+                        "جرّب ملفاً أصغر أو نصاً أقصر.",
+                        reply_markup=translation_menu(),
                     )
                 except (TimedOut, NetworkError):
                     await context.bot.send_message(
@@ -429,6 +449,13 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
                     user_dir, direction, status.message_id,
                     image=True, activity="translate_image",
                 )
+            except asyncio.TimeoutError:
+                await context.bot.send_message(
+                    chat_id,
+                    "❌ انتهت مهلة ترجمة الصورة (30 دقيقة).\n"
+                    "جرّب صورة أصغر أو أوضح.",
+                    reply_markup=translation_menu(),
+                )
             except RuntimeError as e:
                 await context.bot.send_message(
                     chat_id,
@@ -457,6 +484,10 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         states={
             states.TR_WAIT_DIRECTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, set_direction_message),
+                MessageHandler(
+                    filters.Document.ALL | filters.PHOTO,
+                    wait_direction_media_hint,
+                ),
                 CallbackQueryHandler(set_direction, pattern="^tr_dir_"),
             ],
             states.TR_WAIT_TEXT: [

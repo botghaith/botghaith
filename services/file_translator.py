@@ -36,10 +36,51 @@ MAX_FILE_MB = 50
 WORD_TOKEN_RE = re.compile(r"\S+")
 WORD_CHAR_RE = re.compile(r"[\w\u0600-\u06FF]", re.UNICODE)
 _word_cache: dict[tuple[str, str], str] = {}
+_WORD_BATCH_SIZE = 15
 
 
 def _clear_word_cache():
     _word_cache.clear()
+
+
+def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
+    """ترجمة الكلمات الفريدة دفعة واحدة — أسرع بكثير من كلمة/طلب."""
+    direction = resolve_direction(text, direction)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for unit in _extract_logical_units(text):
+        for token in WORD_TOKEN_RE.findall(unit):
+            key = token.lower()
+            if key not in seen and WORD_CHAR_RE.search(token):
+                seen.add(key)
+                unique.append(token)
+    if not unique:
+        return
+
+    logger.info("Prewarming word cache: %d unique tokens", len(unique))
+    for i in range(0, len(unique), _WORD_BATCH_SIZE):
+        chunk = unique[i:i + _WORD_BATCH_SIZE]
+        payload = "\n".join(f"{idx + 1}. {w}" for idx, w in enumerate(chunk))
+        try:
+            translated = translate_text(payload, direction)
+            lines = [ln.strip() for ln in translated.splitlines() if ln.strip()]
+            parsed: list[str] = []
+            for ln in lines:
+                m = re.match(r"^\d+\.\s*(.+)$", ln)
+                parsed.append(m.group(1).strip() if m else ln)
+            if len(parsed) == len(chunk):
+                for w, tw in zip(chunk, parsed):
+                    _word_cache[(w.lower(), direction)] = tw
+                continue
+        except Exception as e:
+            logger.warning("Batch word prewarm failed: %s", e)
+        for w in chunk:
+            key = (w.lower(), direction)
+            if key not in _word_cache:
+                try:
+                    _word_cache[key] = translate_text(w, direction)
+                except Exception:
+                    _word_cache[key] = w
 
 
 def translate_word(word: str, direction: str) -> str:
@@ -717,6 +758,7 @@ def translate_image_two_modes(
         raise ValueError("لم يتم العثور على نص في الصورة")
     _check_file_limits(image_path, content)
     direction = resolve_direction(content, direction)
+    _prewarm_word_cache_for_text(content, direction)
 
     result = _build_literal_files(content, direction, output_dir, stem)
 
@@ -745,6 +787,7 @@ def translate_file_two_modes(
     if not sample.strip():
         raise ValueError("لم يتم العثور على نص في الملف")
     direction = resolve_direction(sample, direction)
+    _prewarm_word_cache_for_text(sample, direction)
 
     if suffix in (".docx", ".doc"):
         result = _translate_docx(source_path, output_dir, stem, direction)

@@ -28,12 +28,26 @@ def _extract_txt(path: Path) -> str:
 
 def _extract_pdf(path: Path) -> str:
     import fitz
+
     doc = fitz.open(str(path))
-    text_parts = []
-    for page in doc:
-        text_parts.append(page.get_text())
+    text_parts = [page.get_text() for page in doc]
     doc.close()
-    return "\n".join(text_parts)
+    native = "\n".join(text_parts).strip()
+    compact = native.replace(" ", "").replace("\n", "")
+    if len(compact) >= 20:
+        return native
+
+    try:
+        from services.ocr_service import extract_pdf_text_smart
+
+        ocr = extract_pdf_text_smart(path, path.parent).strip()
+        if ocr:
+            logger.info("PDF OCR fallback extracted %d chars", len(ocr))
+            return ocr
+    except Exception as e:
+        logger.warning("PDF OCR fallback failed: %s", e)
+
+    return native
 
 
 def _extract_docx(path: Path) -> str:
