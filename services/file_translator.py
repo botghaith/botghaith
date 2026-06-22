@@ -20,6 +20,7 @@ from docx.text.run import Run
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
 from services.translator import translate_text, resolve_direction
+from config import use_fast_file_translation
 from services.text_shape import (
     is_mostly_arabic,
     find_arabic_font,
@@ -744,9 +745,87 @@ def _translate_image_overlay(
     doc.close()
 
 
+def _translate_paragraph_pairs(content: str, direction: str) -> list[tuple[str, str]]:
+    """ترجمة فقرة بفقرة — سريعة ومناسبة للسحابة."""
+    direction = resolve_direction(content, direction)
+    pairs: list[tuple[str, str]] = []
+    units = _extract_logical_units(content)
+    total = len(units)
+    for i, unit in enumerate(units, 1):
+        unit = unit.strip()
+        if not unit:
+            continue
+        if i % 10 == 0 or i == total:
+            logger.info("Translating unit %d/%d", i, total)
+        pairs.append((unit, translate_text(unit, direction)))
+    return pairs
+
+
+def _build_fast_outputs(
+    pairs: list[tuple[str, str]], output_dir: Path, stem: str, direction: str,
+) -> dict[str, Path]:
+    """ملفان: PDF ثنائي + TXT كامل — بدون ترجمة كلمة بكلمة."""
+    line_pdf = output_dir / f"{stem}_1_سطر_بسطر.pdf"
+    create_pairs_pdf(
+        pairs, line_pdf,
+        title="ترجمة سطر بسطر — أصل وترجمة",
+        direction=direction,
+    )
+
+    full_txt = output_dir / f"{stem}_2_ترجمة_كاملة.txt"
+    full_txt.write_text("\n\n".join(tr for _, tr in pairs), encoding="utf-8-sig")
+
+    return {"line_pairs": line_pdf, "structured": full_txt}
+
+
+def translate_file_fast(
+    source_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
+    _clear_word_cache()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = source_path.stem
+
+    content = extract_text_from_file(source_path)
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الملف")
+    _check_file_limits(source_path, content)
+    direction = resolve_direction(content, direction)
+
+    logger.info("Fast file translation: %s (%d chars)", source_path.name, len(content))
+    pairs = _translate_paragraph_pairs(content, direction)
+    if not pairs:
+        raise ValueError("لم يتم العثور على فقرات للترجمة")
+    return _build_fast_outputs(pairs, output_dir, stem, direction)
+
+
+def translate_image_fast(
+    image_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
+    _clear_word_cache()
+    from services.ocr_service import ocr_image
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = image_path.stem
+
+    content = ocr_image(image_path)
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الصورة")
+    _check_file_limits(image_path, content)
+    direction = resolve_direction(content, direction)
+
+    logger.info("Fast image translation: %s (%d chars)", image_path.name, len(content))
+    pairs = _translate_paragraph_pairs(content, direction)
+    if not pairs:
+        raise ValueError("لم يتم العثور على نص للترجمة في الصورة")
+    return _build_fast_outputs(pairs, output_dir, stem, direction)
+
+
 def translate_image_two_modes(
     image_path: Path, output_dir: Path, direction: str = "auto"
 ) -> dict[str, Path]:
+    if use_fast_file_translation():
+        return translate_image_fast(image_path, output_dir, direction)
+
     _clear_word_cache()
     from services.ocr_service import ocr_image_layout
 
@@ -778,6 +857,9 @@ def translate_image_two_modes(
 def translate_file_two_modes(
     source_path: Path, output_dir: Path, direction: str = "auto"
 ) -> dict[str, Path]:
+    if use_fast_file_translation():
+        return translate_file_fast(source_path, output_dir, direction)
+
     _clear_word_cache()
     suffix = source_path.suffix.lower()
     stem = source_path.stem

@@ -28,6 +28,15 @@ def use_online_translate() -> bool:
         return False
     return os.getenv("USE_ONLINE_TRANSLATE", "1") == "1"
 
+
+def use_fast_file_translation() -> bool:
+    """على Render: ترجمة فقرات فقط (سريعة). محلياً: 4 صيغ كاملة."""
+    if os.getenv("FILE_TRANSLATE_FULL", "") == "1":
+        return False
+    if os.getenv("FILE_TRANSLATE_FAST", "") == "1":
+        return True
+    return bool(os.getenv("RENDER"))
+
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
 CHANNEL_REQUIRED = os.getenv("CHANNEL_REQUIRED", "1") == "1"

@@ -12,7 +12,7 @@ from telegram.ext import (
 from database.db import Database
 from services.channel_check import check_channel_subscription
 from services.file_translator import translate_file_two_modes, translate_image_two_modes
-from config import use_online_translate
+from config import use_online_translate, use_fast_file_translation
 from services.translator import (
     translate_text_dual,
     resolve_direction,
@@ -225,11 +225,12 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
     async def _send_translation_outputs(context, chat_id: int, outputs: dict, source_label: str):
         captions = {
             "literal": "1️⃣ حرفي — PDF (كلمة وترجمتها بجانب بعض)",
-            "structured": "2️⃣ نفس ترتيب الصورة/الملف — مترجم بالكامل",
-            "line_pairs": "3️⃣ سطر بسطر — كل سطر وترجمته تحته",
+            "structured": "2️⃣ الترجمة الكاملة",
+            "line_pairs": "1️⃣ سطر بسطر — أصل وترجمة",
             "overlay": "4️⃣ فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
         }
         send_order = ("literal", "structured", "line_pairs", "overlay")
+        sent = 0
         for key in send_order:
             path = outputs.get(key)
             if not path:
@@ -241,14 +242,25 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
                     filename=path.name,
                     caption=captions.get(key, ""),
                 )
+            sent += 1
 
+        if use_fast_file_translation():
+            summary = (
+                f"✅ تمت ترجمة {source_label}! ({sent} ملف)\n\n"
+                "1️⃣ سطر بسطر — PDF (أصل + ترجمة)\n"
+                "2️⃣ ترجمة كاملة — TXT"
+            )
+        else:
+            summary = (
+                f"✅ تم إنشاء ملفات ترجمة {source_label}!\n\n"
+                "1️⃣ حرفي — PDF\n"
+                "2️⃣ بنفس الترتيب — مترجم بالكامل\n"
+                "3️⃣ سطر بسطر — أصل وترجمة\n"
+                "4️⃣ فوق الكلمات — ترجمة فوق كل كلمة"
+            )
         await context.bot.send_message(
             chat_id,
-            f"✅ تم إنشاء ملفات ترجمة {source_label}!\n\n"
-            "1️⃣ حرفي — PDF\n"
-            "2️⃣ بنفس الترتيب — مترجم بالكامل\n"
-            "3️⃣ سطر بسطر — أصل وترجمة\n"
-            "4️⃣ فوق الكلمات — ترجمة فوق كل كلمة",
+            summary,
             reply_markup=translation_menu(),
         )
 
@@ -258,14 +270,24 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         *, image: bool = False, activity: str = "translate_file",
     ):
         stop_event = asyncio.Event()
-        steps = [
-            "⏳ جاري استخراج النص من الصورة..." if image else "⏳ جاري تحليل الملف...",
-            "⏳ جاري إنشاء الملف 1 (حرفي PDF)...",
-            "⏳ جاري إنشاء الملف 2 (بنفس الترتيب)...",
-            "⏳ جاري إنشاء الملف 3 (سطر بسطر)...",
-            "⏳ جاري إنشاء الملف 4 (فوق الكلمات)...",
-            "⏳ لا يزال جاري الترجمة...",
-        ]
+        if use_fast_file_translation():
+            steps = [
+                "⏳ جاري استخراج النص..." if image else "⏳ جاري قراءة الملف...",
+                "⏳ جاري ترجمة الفقرات...",
+                "⏳ جاري إنشاء ملفات النتيجة...",
+                "⏳ لا يزال جاري الترجمة...",
+            ]
+            job_timeout = 600.0
+        else:
+            steps = [
+                "⏳ جاري استخراج النص من الصورة..." if image else "⏳ جاري تحليل الملف...",
+                "⏳ جاري إنشاء الملف 1 (حرفي PDF)...",
+                "⏳ جاري إنشاء الملف 2 (بنفس الترتيب)...",
+                "⏳ جاري إنشاء الملف 3 (سطر بسطر)...",
+                "⏳ جاري إنشاء الملف 4 (فوق الكلمات)...",
+                "⏳ لا يزال جاري الترجمة...",
+            ]
+            job_timeout = 1800.0
         ticker = asyncio.create_task(
             progress_ticker(context.bot, chat_id, status_msg_id, steps, stop_event=stop_event)
         )
@@ -273,8 +295,18 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             fn = translate_image_two_modes if image else translate_file_two_modes
             outputs = await asyncio.wait_for(
                 asyncio.to_thread(fn, media_path, user_dir, direction),
-                timeout=1800.0,
+                timeout=job_timeout,
             )
+        except Exception:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg_id,
+                    text="❌ فشلت الترجمة — جاري إرسال التفاصيل...",
+                )
+            except Exception:
+                pass
+            raise
         finally:
             stop_event.set()
             ticker.cancel()
@@ -364,7 +396,7 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
                 except asyncio.TimeoutError:
                     await context.bot.send_message(
                         chat_id,
-                        "❌ انتهت مهلة ترجمة الملف (30 دقيقة).\n"
+                        "❌ انتهت مهلة ترجمة الملف (10 دقائق).\n"
                         "جرّب ملفاً أصغر أو نصاً أقصر.",
                         reply_markup=translation_menu(),
                     )
@@ -452,7 +484,7 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             except asyncio.TimeoutError:
                 await context.bot.send_message(
                     chat_id,
-                    "❌ انتهت مهلة ترجمة الصورة (30 دقيقة).\n"
+                    "❌ انتهت مهلة ترجمة الصورة (10 دقائق).\n"
                     "جرّب صورة أصغر أو أوضح.",
                     reply_markup=translation_menu(),
                 )
