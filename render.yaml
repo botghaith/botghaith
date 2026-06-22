@@ -1,13 +1,12 @@
 services:
-  - type: web
-    name: botghaith-bot
+  - type: worker
+    name: helpsmart3-bot
     runtime: python
-    plan: free
+    plan: starter
     repo: https://github.com/botghaith/botghaith
     branch: main
     buildCommand: python --version && pip install -r requirements.txt
     startCommand: python bot.py
-    healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
