@@ -44,6 +44,27 @@ def translation_direction_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 اكتشاف تلقائي", callback_data="tr_dir_auto")],
     ])
 
+
+def translation_direction_reply_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["عربي → إنجليزي", "إنجليزي → عربي"],
+            ["🔄 اكتشاف تلقائي", "🔙 القائمة الرئيسية"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+_DIRECTION_FROM_TEXT = {
+    "عربي → إنجليزي": "ar_en",
+    "إنجليزي → عربي": "en_ar",
+    "🔄 اكتشاف تلقائي": "auto",
+}
+
+
+def parse_direction_text(text: str) -> str | None:
+    return _DIRECTION_FROM_TEXT.get((text or "").strip())
+
 # ── PDF Tools ──
 
 def pdf_menu() -> ReplyKeyboardMarkup:

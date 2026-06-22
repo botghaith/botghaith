@@ -21,7 +21,12 @@ from services.translator import (
 )
 from utils.helpers import get_user_temp_dir, truncate_text
 from utils.background_jobs import spawn_background, progress_ticker
-from utils.keyboards import translation_menu, translation_direction_menu, MAIN_MENU
+from utils.keyboards import (
+    translation_menu,
+    translation_direction_reply_menu,
+    parse_direction_text,
+    MAIN_MENU,
+)
 from utils import states
 
 logger = logging.getLogger(__name__)
@@ -82,9 +87,46 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             "🌐 اختر اتجاه الترجمة:\n"
             "أو اختر **اكتشاف تلقائي** ليتعرف البوت على اللغة بنفسه.",
             parse_mode="Markdown",
-            reply_markup=translation_direction_menu(),
+            reply_markup=translation_direction_reply_menu(),
         )
         return states.TR_WAIT_DIRECTION
+
+    async def set_direction_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message.text == "🔙 القائمة الرئيسية":
+            return await back_to_main(update, context)
+
+        raw = parse_direction_text(update.message.text)
+        if not raw:
+            await update.message.reply_text(
+                "❌ اختر اتجاهاً من الأزرار أدناه.",
+                reply_markup=translation_direction_reply_menu(),
+            )
+            return states.TR_WAIT_DIRECTION
+
+        context.user_data["tr_direction"] = raw
+        mode = context.user_data.get("tr_mode", "text")
+        dir_label = "🔄 اكتشاف تلقائي" if raw == "auto" else direction_label(raw)
+
+        if mode == "text":
+            await update.message.reply_text(
+                f"✅ الاتجاه: {dir_label}\n\n"
+                "أرسل النص للترجمة (جملة أو فقرة أو أكثر):",
+                reply_markup=translation_menu(),
+            )
+            return states.TR_WAIT_TEXT
+        if mode == "image":
+            await update.message.reply_text(
+                f"✅ الاتجاه: {dir_label}\n\n"
+                "أرسل الصورة الآن (JPG / PNG / WEBP):",
+                reply_markup=translation_menu(),
+            )
+            return states.TR_WAIT_IMAGE
+        await update.message.reply_text(
+            f"✅ الاتجاه: {dir_label}\n\n"
+            "أرسل الملف (PDF / TXT / DOCX):",
+            reply_markup=translation_menu(),
+        )
+        return states.TR_WAIT_FILE
 
     async def set_direction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -122,6 +164,9 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             return await back_to_main(update, context)
 
         text = (update.message.text or "").strip()
+        if text in {"📝 ترجمة نص", "📁 ترجمة ملف", "🖼️ ترجمة صورة", "📚 الترجمة"}:
+            await update.message.reply_text("📨 أرسل النص المراد ترجمته (مو زر القائمة).")
+            return states.TR_WAIT_TEXT
         if len(text) < 2:
             await update.message.reply_text("❌ أرسل نصاً أطول للترجمة.")
             return states.TR_WAIT_TEXT
@@ -411,6 +456,7 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         ],
         states={
             states.TR_WAIT_DIRECTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_direction_message),
                 CallbackQueryHandler(set_direction, pattern="^tr_dir_"),
             ],
             states.TR_WAIT_TEXT: [
@@ -430,5 +476,4 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             MessageHandler(filters.Regex("^❌ إلغاء$"), back_to_main),
         ],
         allow_reentry=True,
-        per_message=True,
     )
