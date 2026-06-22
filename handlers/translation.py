@@ -13,8 +13,7 @@ from database.db import Database
 from services.channel_check import check_channel_subscription
 from services.file_translator import translate_file_two_modes, translate_image_two_modes
 from services.translator import (
-    translate_interleaved,
-    format_full_translation,
+    translate_text_dual,
     resolve_direction,
     direction_label,
     is_translator_ready,
@@ -130,15 +129,14 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         user_id = update.effective_user.id
 
         status = await update.message.reply_text(
-            "⏳ بدأت الترجمة في الخلفية...\n"
-            "💡 يمكنك استخدام باقي الخدمات — سيصلك الناتج عند الانتهاء."
+            "⏳ جاري الترجمة..."
         )
 
         async def _job():
             try:
-                interleaved, full_tr = await asyncio.gather(
-                    asyncio.to_thread(translate_interleaved, text, actual_dir),
-                    asyncio.to_thread(format_full_translation, text, actual_dir),
+                interleaved, full_tr = await asyncio.wait_for(
+                    asyncio.to_thread(translate_text_dual, text, actual_dir),
+                    timeout=180.0,
                 )
                 header = (
                     f"✅ تمت الترجمة ({direction_label(actual_dir)})\n"
@@ -160,6 +158,20 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
                     reply_markup=translation_menu(),
                 )
                 db.log_activity(user_id, "translate_text")
+            except asyncio.TimeoutError:
+                await context.bot.send_message(
+                    chat_id,
+                    "❌ انتهت مهلة الترجمة.\n"
+                    "السيرفر مشغول — جرّب نصاً أقصر أو حاول بعد دقيقة.",
+                    reply_markup=translation_menu(),
+                )
+            except RuntimeError as e:
+                await context.bot.send_message(
+                    chat_id,
+                    f"❌ {e}\n"
+                    "أعد تشغيل الخدمة على Render (Manual Deploy) ثم حاول مجدداً.",
+                    reply_markup=translation_menu(),
+                )
             except Exception as e:
                 logger.error(f"Text translation error: {e}", exc_info=True)
                 await context.bot.send_message(

@@ -1,12 +1,14 @@
 import html
 import logging
 import re
+import threading
 
 logger = logging.getLogger(__name__)
 
 _translator_ready = False
 _ar_en = None
 _en_ar = None
+_init_lock = threading.Lock()
 
 CHUNK_SIZE = 450
 ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
@@ -17,38 +19,42 @@ def _ensure_translator():
     global _translator_ready, _ar_en, _en_ar
     if _translator_ready:
         return True
-    try:
-        import argostranslate.package
-        import argostranslate.translate
+    with _init_lock:
+        if _translator_ready:
+            return True
+        try:
+            import argostranslate.package
+            import argostranslate.translate
 
-        installed = argostranslate.package.get_installed_packages()
-        has_ar_en = any(p.from_code == "ar" and p.to_code == "en" for p in installed)
-        has_en_ar = any(p.from_code == "en" and p.to_code == "ar" for p in installed)
+            installed = argostranslate.package.get_installed_packages()
+            has_ar_en = any(p.from_code == "ar" and p.to_code == "en" for p in installed)
+            has_en_ar = any(p.from_code == "en" and p.to_code == "ar" for p in installed)
 
-        if not has_ar_en or not has_en_ar:
-            argostranslate.package.update_package_index()
-            available = argostranslate.package.get_available_packages()
-            for from_code, to_code in [("ar", "en"), ("en", "ar")]:
-                if any(p.from_code == from_code and p.to_code == to_code for p in installed):
-                    continue
-                pkg = next(
-                    (p for p in available if p.from_code == from_code and p.to_code == to_code),
-                    None,
-                )
-                if pkg:
-                    argostranslate.package.install_from_path(pkg.download())
+            if not has_ar_en or not has_en_ar:
+                logger.info("Downloading Argos translation packages...")
+                argostranslate.package.update_package_index()
+                available = argostranslate.package.get_available_packages()
+                for from_code, to_code in [("ar", "en"), ("en", "ar")]:
+                    if any(p.from_code == from_code and p.to_code == to_code for p in installed):
+                        continue
+                    pkg = next(
+                        (p for p in available if p.from_code == from_code and p.to_code == to_code),
+                        None,
+                    )
+                    if pkg:
+                        argostranslate.package.install_from_path(pkg.download())
 
-        _ar_en = argostranslate.translate.get_translation_from_codes("ar", "en")
-        _en_ar = argostranslate.translate.get_translation_from_codes("en", "ar")
-        if not _ar_en or not _en_ar:
-            raise RuntimeError("حزم الترجمة غير متوفرة")
-        _translator_ready = True
-        logger.info("Argos Translate initialized successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to init translator: {e}")
-        _translator_ready = False
-        return False
+            _ar_en = argostranslate.translate.get_translation_from_codes("ar", "en")
+            _en_ar = argostranslate.translate.get_translation_from_codes("en", "ar")
+            if not _ar_en or not _en_ar:
+                raise RuntimeError("حزم الترجمة غير متوفرة")
+            _translator_ready = True
+            logger.info("Argos Translate initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to init translator: {e}")
+            _translator_ready = False
+            return False
 
 
 def is_translator_ready() -> bool:
@@ -180,6 +186,19 @@ def format_bilingual_plain(text: str, direction: str = "en_ar") -> str:
 
 def translate_interleaved(text: str, direction: str = "en_ar") -> str:
     return format_interleaved_html(text, direction)
+
+
+def translate_text_dual(text: str, direction: str = "auto") -> tuple[str, str]:
+    """ترجمة واحدة للنص — عرض ثنائي + نص كامل."""
+    direction = resolve_direction(text, direction)
+    if not _ensure_translator():
+        raise RuntimeError("محرك الترجمة غير جاهز على السيرفر")
+    pairs = [(unit, translate_text(unit, direction)) for unit in split_units(text)]
+    interleaved = "\n\n".join(
+        f"<b>{_esc(src)}</b>\n<i>{_esc(tr)}</i>" for src, tr in pairs
+    )
+    full = "\n\n".join(tr for _, tr in pairs)
+    return interleaved, full
 
 
 def translate_file_content(text: str, direction: str = "en_ar") -> str:

@@ -70,6 +70,7 @@ def main() -> None:
         sys.exit(1)
 
     db = get_database()
+    logger.info("Installing translation packages...")
     install_translation_packages()
 
     app = create_application(db)
