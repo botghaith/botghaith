@@ -12,6 +12,7 @@ from telegram.ext import (
 from database.db import Database
 from services.channel_check import check_channel_subscription
 from services.file_translator import translate_file_two_modes, translate_image_two_modes
+from config import use_online_translate
 from services.translator import (
     translate_text_dual,
     resolve_direction,
@@ -49,7 +50,9 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
     async def enter_translation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await check_channel_subscription(update, context, db):
             return ConversationHandler.END
-        ready = "✅ المحرك جاهز" if is_translator_ready() else "⏳ جاري تحميل محرك الترجمة — انتظر 30 ثانية ثم أرسل النص"
+        ready = "✅ جاهز للترجمة" if use_online_translate() else (
+            "✅ المحرك جاهز" if is_translator_ready() else "⏳ جاري تحميل محرك الترجمة..."
+        )
         await update.message.reply_text(
             f"📚 **قسم الترجمة**\n{ready}\n\n"
             "اختر نوع الترجمة:\n"
@@ -427,4 +430,5 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             MessageHandler(filters.Regex("^❌ إلغاء$"), back_to_main),
         ],
         allow_reentry=True,
+        per_message=True,
     )

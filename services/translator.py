@@ -132,7 +132,35 @@ def split_units(text: str) -> list[str]:
     return result
 
 
+def _google_translate(text: str, direction: str) -> str:
+    from deep_translator import GoogleTranslator
+
+    src, tgt = ("ar", "en") if direction == "ar_en" else ("en", "ar")
+    return GoogleTranslator(source=src, target=tgt).translate(text)
+
+
 def _online_translate(text: str, direction: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    errors = []
+    for fn in (_google_translate, _mymemory_translate):
+        try:
+            result = fn(text, direction).strip()
+            if not result:
+                continue
+            if result.upper() == text.upper():
+                continue
+            if "MYMEMORY WARNING" in result.upper():
+                continue
+            return result
+        except Exception as e:
+            errors.append(str(e))
+            logger.warning("Translation provider failed: %s", e)
+    raise RuntimeError("فشلت الترجمة: " + (errors[-1] if errors else "لا توجد خدمة متاحة"))
+
+
+def _mymemory_translate(text: str, direction: str) -> str:
     langpair = "ar|en" if direction == "ar_en" else "en|ar"
     url = (
         "https://api.mymemory.translated.net/get?q="
@@ -144,7 +172,7 @@ def _online_translate(text: str, direction: str) -> str:
         data = json.loads(resp.read().decode())
     translated = (data.get("responseData") or {}).get("translatedText", "").strip()
     if not translated:
-        raise RuntimeError("فشلت الترجمة عبر الإنترنت")
+        raise RuntimeError("MyMemory returned empty")
     return translated
 
 
@@ -178,7 +206,7 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
         return _online_translate_long(text, direction)
     except Exception as e:
         logger.error("Online translation error: %s", e)
-        return _fallback_translate(text, direction)
+        raise RuntimeError(f"تعذرت الترجمة: {e}") from e
 
 
 def translate_units(text: str, direction: str = "en_ar") -> list[tuple[str, str]]:

@@ -11,3 +11,4 @@ arabic-reshaper==3.0.0
 python-bidi==0.4.2
 pytesseract==0.3.13
 supabase>=2.16.0
+deep-translator==1.11.4

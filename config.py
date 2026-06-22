@@ -23,8 +23,10 @@ def is_supabase_enabled() -> bool:
 
 
 def use_online_translate() -> bool:
-    """على Render نستخدم ترجمة أونلاين — أخف وأسرع من Argos."""
-    return os.getenv("RENDER") == "true" or os.getenv("USE_ONLINE_TRANSLATE", "") == "1"
+    """ترجمة أونلاين افتراضياً — Argos للملفات فقط كاحتياط."""
+    if os.getenv("USE_OFFLINE_TRANSLATE", "") == "1":
+        return False
+    return os.getenv("USE_ONLINE_TRANSLATE", "1") == "1"
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
