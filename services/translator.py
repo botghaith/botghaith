@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR قبل argostranslate
-from config import use_online_translate
+from config import use_online_translate, prefer_local_for_files
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,21 @@ _translator_ready = False
 _ar_en = None
 _en_ar = None
 _init_lock = threading.Lock()
+_file_mode = threading.local()
+
+
+def set_file_translation_mode(enabled: bool) -> None:
+    _file_mode.enabled = enabled
+
+
+def _is_file_translation_mode() -> bool:
+    return bool(getattr(_file_mode, "enabled", False))
+
+
+def _argos_translate(text: str, direction: str) -> str:
+    engine = _ar_en if direction == "ar_en" else _en_ar
+    chunks = _chunk_text(text)
+    return "\n".join(engine.translate(c) for c in chunks).strip()
 
 CHUNK_SIZE = 450
 ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
@@ -251,7 +266,15 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
         return ""
     direction = resolve_direction(text, direction)
 
-    if use_online_translate():
+    use_local_first = _is_file_translation_mode() and prefer_local_for_files()
+
+    if use_local_first and _ensure_translator():
+        try:
+            return _argos_translate(text, direction)
+        except Exception as e:
+            logger.warning("Local file translation failed, trying online: %s", e)
+
+    if use_online_translate() and not use_local_first:
         try:
             return _online_translate_long(text, direction)
         except Exception as e:
@@ -259,9 +282,7 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
 
     if _ensure_translator():
         try:
-            engine = _ar_en if direction == "ar_en" else _en_ar
-            chunks = _chunk_text(text)
-            return "\n".join(engine.translate(c) for c in chunks).strip()
+            return _argos_translate(text, direction)
         except Exception as e:
             logger.warning("Argos translation failed, trying online: %s", e)
 

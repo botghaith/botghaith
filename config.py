@@ -33,6 +33,20 @@ def use_fast_file_translation() -> bool:
     """الوضع السريع (ملفان فقط) — اختياري. الافتراضي: 4 ملفات كاملة."""
     return os.getenv("FILE_TRANSLATE_FAST", "") == "1"
 
+
+def translation_use_supabase() -> bool:
+    """الترجمة لا تستخدم Supabase افتراضياً — أسرع على Render."""
+    return os.getenv("TRANSLATION_USE_SUPABASE", "") == "1"
+
+
+def prefer_local_for_files() -> bool:
+    """ملفات/صور: Argos محلي على Render — أسرع من آلاف طلبات الإنترنت."""
+    if os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
+        return False
+    if os.getenv("FILE_TRANSLATE_LOCAL", "") == "1":
+        return True
+    return bool(os.getenv("RENDER"))
+
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
 CHANNEL_REQUIRED = os.getenv("CHANNEL_REQUIRED", "1") == "1"

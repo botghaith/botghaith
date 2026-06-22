@@ -13,7 +13,7 @@ from telegram.error import Conflict
 from telegram.ext import Application
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR
-from config import BOT_TOKEN, is_supabase_enabled
+from config import BOT_TOKEN, is_supabase_enabled, prefer_local_for_files
 from database import get_database
 from handlers.admin import setup_admin_handlers
 from handlers.exams import setup_exam_handlers
@@ -22,6 +22,7 @@ from handlers.start import setup_start_handlers
 from handlers.student import setup_student_handlers
 from handlers.translation import setup_translation_handlers
 from setup_translate import install_translation_packages
+from services.translator import is_translator_ready
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,6 +37,8 @@ def create_application(db) -> Application:
     async def post_init(_application: Application) -> None:
         logger.info("Installing translation packages in background...")
         await asyncio.to_thread(install_translation_packages)
+        if prefer_local_for_files():
+            await asyncio.to_thread(is_translator_ready)
         logger.info("Translation packages ready")
 
     start_handlers, back_to_main = setup_start_handlers(db)
@@ -67,7 +70,7 @@ def create_application(db) -> Application:
     for handler in start_handlers:
         app.add_handler(handler, group=-1)
 
-    app.add_handler(setup_translation_handlers(db, back_to_main))
+    app.add_handler(setup_translation_handlers(back_to_main))
     app.add_handler(setup_pdf_handlers(db, back_to_main))
 
     for handler in setup_exam_handlers(db, back_to_main):

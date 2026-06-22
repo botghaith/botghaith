@@ -66,6 +66,41 @@ async def _send_subscription_prompt(
             )
 
 
+async def check_channel_for_translation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """تحقق اشتراك القناة بدون Supabase — من env فقط."""
+    from config import CHANNEL_REQUIRED, CHANNEL_USERNAME, CHANNEL_LINK
+
+    if context.user_data.get("tr_channel_ok"):
+        return True
+
+    if not CHANNEL_REQUIRED:
+        context.user_data["tr_channel_ok"] = True
+        return True
+
+    username = CHANNEL_USERNAME.lstrip("@")
+    if not username:
+        context.user_data["tr_channel_ok"] = True
+        return True
+
+    channels = [{
+        "username": username,
+        "link": CHANNEL_LINK or f"https://t.me/{username}",
+        "title": username,
+    }]
+    user_id = update.effective_user.id
+    missing = await _get_missing_channels(context.bot, channels, user_id)
+    if missing:
+        text = _subscription_message(missing)
+        markup = channel_subscribe_keyboard(missing)
+        await _send_subscription_prompt(update, context, text, markup)
+        return False
+
+    context.user_data["tr_channel_ok"] = True
+    return True
+
+
 async def check_channel_subscription(
     update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database
 ) -> bool:

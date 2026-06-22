@@ -19,7 +19,7 @@ from docx.text.run import Run
 
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
-from services.translator import translate_text, resolve_direction
+from services.translator import translate_text, resolve_direction, set_file_translation_mode
 from config import use_fast_file_translation
 from services.text_shape import (
     is_mostly_arabic,
@@ -826,6 +826,16 @@ def translate_image_two_modes(
     if use_fast_file_translation():
         return translate_image_fast(image_path, output_dir, direction)
 
+    set_file_translation_mode(True)
+    try:
+        return _translate_image_full(image_path, output_dir, direction)
+    finally:
+        set_file_translation_mode(False)
+
+
+def _translate_image_full(
+    image_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
     _clear_word_cache()
     from services.ocr_service import ocr_image_layout
 
@@ -867,6 +877,16 @@ def translate_file_two_modes(
     if use_fast_file_translation():
         return translate_file_fast(source_path, output_dir, direction)
 
+    set_file_translation_mode(True)
+    try:
+        return _translate_file_full(source_path, output_dir, direction)
+    finally:
+        set_file_translation_mode(False)
+
+
+def _translate_file_full(
+    source_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
     _clear_word_cache()
     suffix = source_path.suffix.lower()
     stem = source_path.stem

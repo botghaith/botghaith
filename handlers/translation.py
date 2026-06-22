@@ -9,8 +9,7 @@ from telegram.ext import (
     ContextTypes, ConversationHandler, MessageHandler, CallbackQueryHandler, filters,
 )
 
-from database.db import Database
-from services.channel_check import check_channel_subscription
+from services.channel_check import check_channel_for_translation
 from services.file_translator import translate_file_two_modes, translate_image_two_modes
 from config import use_online_translate
 from services.translator import (
@@ -51,9 +50,9 @@ def _split_message(text: str, limit: int = MSG_LIMIT) -> list[str]:
     return parts or [text[:limit]]
 
 
-def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandler:
+def setup_translation_handlers(back_to_main) -> ConversationHandler:
     async def enter_translation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await check_channel_subscription(update, context, db):
+        if not await check_channel_for_translation(update, context):
             return ConversationHandler.END
         ready = "✅ جاهز للترجمة" if use_online_translate() else (
             "✅ المحرك جاهز" if is_translator_ready() else "⏳ جاري تحميل محرك الترجمة..."
@@ -70,7 +69,7 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
         return ConversationHandler.END
 
     async def ask_direction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await check_channel_subscription(update, context, db):
+        if not await check_channel_for_translation(update, context):
             return ConversationHandler.END
 
         text = update.message.text
@@ -202,7 +201,6 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
                 f"📝 الترجمة الكاملة:\n\n{truncate_text(full_tr, 3500)}",
                 reply_markup=translation_menu(),
             )
-            db.log_activity(user_id, "translate_text")
         except asyncio.TimeoutError:
             await update.message.reply_text(
                 "❌ انتهت مهلة الترجمة — جرّب نصاً أقصر.",
@@ -299,8 +297,6 @@ def setup_translation_handlers(db: Database, back_to_main) -> ConversationHandle
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
         except Exception:
             pass
-
-        db.log_activity(user_id, activity, media_path.name)
 
     async def _translate_file_job(
         context, chat_id: int, user_id: int, file_path: Path,
