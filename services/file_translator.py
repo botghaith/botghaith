@@ -19,8 +19,8 @@ from docx.text.run import Run
 
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
-from services.translator import translate_text, resolve_direction, set_file_translation_mode
-from config import use_fast_file_translation
+from services.translator import translate_text, resolve_direction, set_file_translation_mode, is_translator_ready
+from config import use_fast_file_translation, prefer_local_for_files
 from services.text_shape import (
     is_mostly_arabic,
     find_arabic_font,
@@ -182,6 +182,33 @@ def build_literal_sections(text: str, direction: str) -> list[tuple[str, list[tu
     return sections
 
 
+def build_literal_sections_from_pairs(
+    pairs: list[tuple[str, str]],
+) -> list[tuple[str, list[tuple[str, str]]]]:
+    """حرفي من فقرات مترجمة — بديل سريع عند غياب Argos."""
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
+    for idx, (unit, tr) in enumerate(pairs, 1):
+        src_words = [t for t in WORD_TOKEN_RE.findall(unit) if WORD_CHAR_RE.search(t)]
+        tr_words = [t for t in WORD_TOKEN_RE.findall(tr) if WORD_CHAR_RE.search(t)]
+        if src_words and len(src_words) == len(tr_words):
+            word_pairs = list(zip(src_words, tr_words))
+        elif src_words:
+            word_pairs = [(w, tr) for w in src_words]
+        else:
+            word_pairs = [(unit, tr)]
+        sections.append((f"الفقرة {idx}", word_pairs))
+    return sections
+
+
+def _build_literal_files_from_pairs(
+    pairs: list[tuple[str, str]], direction: str, out_dir: Path, stem: str,
+) -> dict[str, Path]:
+    sections = build_literal_sections_from_pairs(pairs)
+    literal_pdf = out_dir / f"{stem}_1_حرفي.pdf"
+    create_literal_pdf(sections, literal_pdf, title="ترجمة حرفية — كلمة بكلمة", direction=direction)
+    return {"literal": literal_pdf}
+
+
 def build_literal_text(text: str, direction: str) -> str:
     """كل كلمة مع ترجمتها في سطر واحد — مرتب حسب الفقرات"""
     lines: list[str] = []
@@ -219,12 +246,140 @@ def build_line_pairs(text: str, direction: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _build_line_pairs_file(content: str, direction: str, out_dir: Path, stem: str) -> dict[str, Path]:
+def _build_line_pairs_file(
+    content: str,
+    direction: str,
+    out_dir: Path,
+    stem: str,
+    pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, Path]:
     direction = resolve_direction(content, direction)
-    pairs = build_line_pairs(content, direction)
+    if pairs is None:
+        pairs = build_line_pairs(content, direction)
     path = out_dir / f"{stem}_3_سطر_بسطر.pdf"
     create_pairs_pdf(pairs, path, title="ترجمة سطر بسطر — أصل وترجمة", direction=direction)
     return {"line_pairs": path}
+
+
+def _write_structured_online(
+    source_path: Path,
+    pairs: list[tuple[str, str]],
+    out_dir: Path,
+    stem: str,
+    direction: str,
+) -> Path:
+    suffix = source_path.suffix.lower()
+    full_text = "\n\n".join(tr for _, tr in pairs)
+
+    if suffix in (".docx", ".doc"):
+        path = out_dir / f"{stem}_2_بنفس_الترتيب.docx"
+        doc = Document()
+        for _, tr in pairs:
+            para = doc.add_paragraph(tr)
+            style_paragraph(para, tr, direction)
+        doc.save(path)
+        return path
+
+    if suffix == ".pdf":
+        path = out_dir / f"{stem}_2_بنفس_الترتيب.pdf"
+        create_pairs_pdf(
+            pairs, path,
+            title="ترجمة بنفس الترتيب — أصل وترجمة",
+            direction=direction,
+        )
+        return path
+
+    path = out_dir / f"{stem}_2_بنفس_الترتيب.txt"
+    path.write_text(full_text, encoding="utf-8-sig")
+    return path
+
+
+def _build_overlay_online(
+    pairs: list[tuple[str, str]], out_dir: Path, stem: str, direction: str,
+) -> dict[str, Path]:
+    """ملف 4 — كلمة وترجمتها (من محاذاة الفقرات)."""
+    sections = build_literal_sections_from_pairs(pairs)
+    flat_pairs: list[tuple[str, str]] = []
+    for _, word_pairs in sections:
+        flat_pairs.extend(word_pairs)
+    path = out_dir / f"{stem}_4_فوق_الكلمات.pdf"
+    create_pairs_pdf(
+        [(_format_word_pair(w, t), "") for w, t in flat_pairs],
+        path,
+        title="ترجمة فوق الكلمات",
+        direction=direction,
+    )
+    return {"overlay": path}
+
+
+def _paragraph_pairs(content: str, direction: str) -> list[tuple[str, str]]:
+    direction = resolve_direction(content, direction)
+    pairs: list[tuple[str, str]] = []
+    for unit in _extract_logical_units(content):
+        unit = unit.strip()
+        if unit:
+            pairs.append((unit, translate_text(unit, direction)))
+    return pairs
+
+
+def _argos_available() -> bool:
+    return prefer_local_for_files() and is_translator_ready()
+
+
+def _translate_file_online_full(
+    source_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
+    """4 ملفات عبر الإنternet — فقرة بفقرة (لا تعليق)."""
+    _clear_word_cache()
+    stem = source_path.stem
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    content = extract_text_from_file(source_path)
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الملف")
+    _check_file_limits(source_path, content)
+    direction = resolve_direction(content, direction)
+
+    logger.info("Online 4-file translation: %s (%d chars)", source_path.name, len(content))
+    pairs = _paragraph_pairs(content, direction)
+    if not pairs:
+        raise ValueError("لم يتم العثور على فقرات للترجمة")
+
+    result = _build_literal_files_from_pairs(pairs, direction, output_dir, stem)
+    result["structured"] = _write_structured_online(source_path, pairs, output_dir, stem, direction)
+    result.update(_build_line_pairs_file(content, direction, output_dir, stem, pairs=pairs))
+    result.update(_build_overlay_online(pairs, output_dir, stem, direction))
+    logger.info("Online 4-file translation done")
+    return result
+
+
+def _translate_image_online_full(
+    image_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
+    from services.ocr_service import ocr_image
+
+    _clear_word_cache()
+    stem = image_path.stem
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    content = ocr_image(image_path)
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الصورة")
+    _check_file_limits(image_path, content)
+    direction = resolve_direction(content, direction)
+
+    logger.info("Online 4-file image translation: %s", image_path.name)
+    pairs = _paragraph_pairs(content, direction)
+    if not pairs:
+        raise ValueError("لم يتم العثور على نص للترجمة في الصورة")
+
+    result = _build_literal_files_from_pairs(pairs, direction, output_dir, stem)
+    structured_pdf = output_dir / f"{stem}_2_بنفس_الترتيب.pdf"
+    create_pairs_pdf(pairs, structured_pdf, title="ترجمة الصورة — أصل وترجمة", direction=direction)
+    result["structured"] = structured_pdf
+    result.update(_build_line_pairs_file(content, direction, output_dir, stem, pairs=pairs))
+    result.update(_build_overlay_online(pairs, output_dir, stem, direction))
+    return result
 
 
 OVERLAY_TR_SIZE = 6
@@ -826,11 +981,15 @@ def translate_image_two_modes(
     if use_fast_file_translation():
         return translate_image_fast(image_path, output_dir, direction)
 
-    set_file_translation_mode(True)
-    try:
-        return _translate_image_full(image_path, output_dir, direction)
-    finally:
-        set_file_translation_mode(False)
+    if _argos_available():
+        set_file_translation_mode(True)
+        try:
+            return _translate_image_full(image_path, output_dir, direction)
+        finally:
+            set_file_translation_mode(False)
+
+    logger.warning("Argos unavailable — online 4-file image mode")
+    return _translate_image_online_full(image_path, output_dir, direction)
 
 
 def _translate_image_full(
@@ -848,9 +1007,6 @@ def _translate_image_full(
     _check_file_limits(image_path, content)
     direction = resolve_direction(content, direction)
     logger.info("Full image translation (4 files): %s", image_path.name)
-    logger.info("Step 0/4: prewarming word cache...")
-    _prewarm_word_cache_for_text(content, direction)
-
     logger.info("Step 1/4: literal PDF...")
     result = _build_literal_files(content, direction, output_dir, stem)
 
@@ -877,11 +1033,15 @@ def translate_file_two_modes(
     if use_fast_file_translation():
         return translate_file_fast(source_path, output_dir, direction)
 
-    set_file_translation_mode(True)
-    try:
-        return _translate_file_full(source_path, output_dir, direction)
-    finally:
-        set_file_translation_mode(False)
+    if _argos_available():
+        set_file_translation_mode(True)
+        try:
+            return _translate_file_full(source_path, output_dir, direction)
+        finally:
+            set_file_translation_mode(False)
+
+    logger.warning("Argos unavailable — online 4-file mode for %s", source_path.name)
+    return _translate_file_online_full(source_path, output_dir, direction)
 
 
 def _translate_file_full(
@@ -897,9 +1057,6 @@ def _translate_file_full(
         raise ValueError("لم يتم العثور على نص في الملف")
     direction = resolve_direction(sample, direction)
     logger.info("Full translation (4 files): %s", source_path.name)
-    logger.info("Step 0/4: prewarming word cache...")
-    _prewarm_word_cache_for_text(sample, direction)
-
     logger.info("Step 1-2/4: literal + structured...")
     if suffix in (".docx", ".doc"):
         result = _translate_docx(source_path, output_dir, stem, direction)

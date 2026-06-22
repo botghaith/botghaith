@@ -36,9 +36,15 @@ def create_application(db) -> Application:
 
     async def post_init(_application: Application) -> None:
         logger.info("Installing translation packages in background...")
-        await asyncio.to_thread(install_translation_packages)
+        await asyncio.to_thread(install_translation_packages, required=bool(os.getenv("RENDER")))
         if prefer_local_for_files():
-            await asyncio.to_thread(is_translator_ready)
+            ready = await asyncio.to_thread(is_translator_ready)
+            if ready:
+                logger.info("Argos translation engine ready for files")
+            else:
+                logger.error(
+                    "Argos NOT ready — file translation will use online fallback (slower)"
+                )
         logger.info("Translation packages ready")
 
     start_handlers, back_to_main = setup_start_handlers(db)
