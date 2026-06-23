@@ -857,20 +857,12 @@ def _pdf_write_in_box(page, rect, text: str, fontsize: float, fontfile: str | No
         page.insert_textbox(rect, display, fontsize=fontsize, align=kwargs["align"])
 
 
-def _translate_pdf(source: Path, out_dir: Path, stem: str, direction: str) -> dict[str, Path]:
+def _build_structured_pdf(source: Path, out_path: Path, direction: str) -> None:
     import fitz
 
-    content = extract_text_from_file(source)
-    _check_file_limits(source, content)
-    direction = resolve_direction(content, direction)
-    fontfile = find_arabic_font()
-
-    literal_files = _build_literal_files(content, direction, out_dir, stem)
-    outputs = dict(literal_files)
     src_doc = fitz.open(str(source))
-    out_path = out_dir / f"{stem}_2_بنفس_الترتيب.pdf"
-
     out_doc = fitz.open()
+    fontfile = find_arabic_font()
 
     for page_num in range(len(src_doc)):
         page = src_doc[page_num]
@@ -917,8 +909,148 @@ def _translate_pdf(source: Path, out_dir: Path, stem: str, direction: str) -> di
     out_doc.save(str(out_path))
     out_doc.close()
     src_doc.close()
-    outputs["structured"] = out_path
 
+
+def prepare_full_file_translation(
+    source_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sample = extract_text_from_file(source_path)
+    if not sample.strip():
+        raise ValueError("لم يتم العثور على نص في الملف")
+    _check_file_limits(source_path, sample)
+    direction = resolve_direction(sample, direction)
+    if not is_translator_ready():
+        raise RuntimeError("محرك الترجمة غير جاهز — انتظر دقيقة ثم أعد المحاولة")
+    _clear_word_cache()
+    return {
+        "source_path": source_path,
+        "output_dir": output_dir,
+        "content": sample,
+        "direction": direction,
+        "stem": source_path.stem,
+        "suffix": source_path.suffix.lower(),
+    }
+
+
+def prepare_full_image_translation(
+    image_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict:
+    from services.ocr_service import ocr_image_layout
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    layout = ocr_image_layout(image_path)
+    content = layout.get("text", "")
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الصورة")
+    _check_file_limits(image_path, content)
+    direction = resolve_direction(content, direction)
+    if not is_translator_ready():
+        raise RuntimeError("محرك الترجمة غير جاهز — انتظر دقيقة ثم أعد المحاولة")
+    _clear_word_cache()
+    return {
+        "image_path": image_path,
+        "layout": layout,
+        "content": content,
+        "direction": direction,
+        "stem": image_path.stem,
+        "output_dir": output_dir,
+    }
+
+
+def build_full_file_literal(data: dict) -> Path:
+    set_file_translation_mode(True)
+    return _build_literal_files(
+        data["content"], data["direction"], data["output_dir"], data["stem"],
+    )["literal"]
+
+
+def build_full_file_structured(data: dict) -> Path:
+    set_file_translation_mode(True)
+    source = data["source_path"]
+    out_dir = data["output_dir"]
+    stem = data["stem"]
+    direction = data["direction"]
+    content = data["content"]
+    suffix = data["suffix"]
+
+    if suffix in (".docx", ".doc"):
+        path = out_dir / f"{stem}_2_بنفس_الترتيب.docx"
+        shutil.copy2(source, path)
+        doc = Document(path)
+        _process_docx_paragraphs(doc, direction)
+        doc.save(path)
+        return path
+    if suffix == ".pdf":
+        path = out_dir / f"{stem}_2_بنفس_الترتيب.pdf"
+        _build_structured_pdf(source, path, direction)
+        return path
+    path = out_dir / f"{stem}_2_بنفس_الترتيب.txt"
+    lines = [
+        translate_text(u, direction)
+        for u in _extract_logical_units(content) if u.strip()
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8-sig")
+    return path
+
+
+def build_full_file_line_pairs(data: dict) -> Path:
+    set_file_translation_mode(True)
+    return _build_line_pairs_file(
+        data["content"], data["direction"], data["output_dir"], data["stem"],
+    )["line_pairs"]
+
+
+def build_full_file_overlay(data: dict) -> Path:
+    set_file_translation_mode(True)
+    return _build_overlay_file(
+        data["source_path"], data["output_dir"], data["stem"],
+        data["direction"], data["content"],
+    )["overlay"]
+
+
+def build_full_image_literal(data: dict) -> Path:
+    set_file_translation_mode(True)
+    return _build_literal_files(
+        data["content"], data["direction"], data["output_dir"], data["stem"],
+    )["literal"]
+
+
+def build_full_image_structured(data: dict) -> Path:
+    set_file_translation_mode(True)
+    path = data["output_dir"] / f"{data['stem']}_2_بنفس_الترتيب.pdf"
+    _translate_image_structured(
+        data["image_path"], data["layout"], path, data["direction"], data["content"],
+    )
+    return path
+
+
+def build_full_image_line_pairs(data: dict) -> Path:
+    set_file_translation_mode(True)
+    return _build_line_pairs_file(
+        data["content"], data["direction"], data["output_dir"], data["stem"],
+    )["line_pairs"]
+
+
+def build_full_image_overlay(data: dict) -> Path:
+    set_file_translation_mode(True)
+    path = data["output_dir"] / f"{data['stem']}_4_فوق_الكلمات.pdf"
+    _translate_image_overlay(
+        data["image_path"], data["layout"], path, data["direction"], data["content"],
+    )
+    return path
+
+
+def _translate_pdf(source: Path, out_dir: Path, stem: str, direction: str) -> dict[str, Path]:
+    content = extract_text_from_file(source)
+    _check_file_limits(source, content)
+    direction = resolve_direction(content, direction)
+
+    literal_files = _build_literal_files(content, direction, out_dir, stem)
+    outputs = dict(literal_files)
+    out_path = out_dir / f"{stem}_2_بنفس_الترتيب.pdf"
+    _build_structured_pdf(source, out_path, direction)
+    outputs["structured"] = out_path
     return outputs
 
 
@@ -1080,18 +1212,11 @@ def translate_image_two_modes(
     if use_fast_file_translation():
         return translate_image_fast(image_path, output_dir, direction)
 
-    if is_render_host() or os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
-        return _translate_image_online_full(image_path, output_dir, direction)
-
-    if _argos_available():
-        set_file_translation_mode(True)
-        try:
-            return _translate_image_full(image_path, output_dir, direction)
-        finally:
-            set_file_translation_mode(False)
-
-    logger.warning("Argos unavailable — online 4-file image mode")
-    return _translate_image_online_full(image_path, output_dir, direction)
+    set_file_translation_mode(True)
+    try:
+        return _translate_image_full(image_path, output_dir, direction)
+    finally:
+        set_file_translation_mode(False)
 
 
 def _translate_image_full(
@@ -1135,19 +1260,11 @@ def translate_file_two_modes(
     if use_fast_file_translation():
         return translate_file_fast(source_path, output_dir, direction)
 
-    # Render: مسار إنترنت فقط — Argos كلمة-بكلمة يعلق
-    if is_render_host() or os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
-        return _translate_file_online_full(source_path, output_dir, direction)
-
-    if _argos_available():
-        set_file_translation_mode(True)
-        try:
-            return _translate_file_full(source_path, output_dir, direction)
-        finally:
-            set_file_translation_mode(False)
-
-    logger.warning("Argos unavailable — online 4-file mode for %s", source_path.name)
-    return _translate_file_online_full(source_path, output_dir, direction)
+    set_file_translation_mode(True)
+    try:
+        return _translate_file_full(source_path, output_dir, direction)
+    finally:
+        set_file_translation_mode(False)
 
 
 def _translate_file_full(

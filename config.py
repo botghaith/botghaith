@@ -40,12 +40,12 @@ def translation_use_supabase() -> bool:
 
 
 def prefer_local_for_files() -> bool:
-    """Argos محلي — للجهاز فقط. Render يستخدم مسار إنترنت موثوق."""
-    if os.getenv("RENDER"):
-        return False
+    """Argos محلي — ترجمة كلمة بكلمة صحيحة للملفات."""
     if os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
         return False
-    return os.getenv("FILE_TRANSLATE_LOCAL", "") == "1"
+    if os.getenv("FILE_TRANSLATE_LOCAL", "") == "1":
+        return True
+    return bool(os.getenv("RENDER"))
 
 
 def is_render_host() -> bool:
