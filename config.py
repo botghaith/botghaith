@@ -40,12 +40,20 @@ def translation_use_supabase() -> bool:
 
 
 def prefer_local_for_files() -> bool:
-    """ملفات/صور: Argos محلي على Render — أسرع من آلاف طلبات الإنترنت."""
+    """Argos محلي — للجهاز فقط. Render يستخدم مسار إنترنت موثوق."""
+    if os.getenv("RENDER"):
+        return False
     if os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
         return False
-    if os.getenv("FILE_TRANSLATE_LOCAL", "") == "1":
-        return True
+    return os.getenv("FILE_TRANSLATE_LOCAL", "") == "1"
+
+
+def is_render_host() -> bool:
     return bool(os.getenv("RENDER"))
+
+
+def file_max_paragraphs() -> int:
+    return int(os.getenv("FILE_MAX_PARAGRAPHS", "120"))
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")

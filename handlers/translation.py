@@ -10,7 +10,17 @@ from telegram.ext import (
 )
 
 from services.channel_check import check_channel_for_translation
-from services.file_translator import translate_file_two_modes, translate_image_two_modes
+from services.file_translator import (
+    translate_file_two_modes,
+    translate_image_two_modes,
+    prepare_online_file_translation,
+    prepare_online_image_translation,
+    build_online_literal,
+    build_online_structured,
+    build_online_line_pairs,
+    build_online_overlay,
+)
+from config import is_render_host
 from config import use_online_translate
 from services.translator import (
     translate_text_dual,
@@ -250,6 +260,73 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             reply_markup=translation_menu(),
         )
 
+    async def _send_one_output(context, chat_id: int, path: Path, caption: str):
+        with open(path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=path.name,
+                caption=caption,
+            )
+
+    async def _translate_file_streaming(
+        context, chat_id: int, file_path: Path, user_dir: Path,
+        direction: str, status_msg_id: int, *, image: bool = False,
+    ):
+        """ترجمة موثوقة: فقرة بفقرة + إرسال كل ملف فور جاهزيته."""
+        captions = {
+            "literal": "1️⃣ حرفي — PDF (كلمة وترجمتها بجانب بعض)",
+            "structured": "2️⃣ نفس ترتيب الصورة/الملف — مترجم بالكامل",
+            "line_pairs": "3️⃣ سطر بسطر — كل سطر وترجمته تحته",
+            "overlay": "4️⃣ فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
+        }
+        steps = [
+            ("literal", build_online_literal, "⏳ جاري إنشاء الملف 1 (حرفي PDF)..."),
+            ("structured", build_online_structured, "⏳ جاري إنشاء الملف 2 (بنفس الترتيب)..."),
+            ("line_pairs", build_online_line_pairs, "⏳ جاري إنشاء الملف 3 (سطر بسطر)..."),
+            ("overlay", build_online_overlay, "⏳ جاري إنشاء الملف 4 (فوق الكلمات)..."),
+        ]
+        label = "الصورة" if image else "الملف"
+        prepare_fn = prepare_online_image_translation if image else prepare_online_file_translation
+
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=status_msg_id,
+            text="⏳ جاري قراءة النص وترجمة الفقرات...\n"
+            "📌 سيصلك كل ملف فور اكتماله.",
+        )
+        data = await asyncio.wait_for(
+            asyncio.to_thread(prepare_fn, file_path, direction),
+            timeout=900.0,
+        )
+
+        sent = 0
+        for key, builder, msg in steps:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=status_msg_id, text=msg,
+            )
+            path = await asyncio.to_thread(builder, data, user_dir)
+            await _send_one_output(context, chat_id, path, captions[key])
+            sent += 1
+
+        note = ""
+        if data.get("truncated"):
+            note = f"\n\n⚠️ {label} كبير — تمت ترجمة أول {len(data['pairs'])} فقرة."
+
+        await context.bot.send_message(
+            chat_id,
+            f"✅ تم إرسال {sent} ملفات ترجمة {label}!{note}\n\n"
+            "1️⃣ حرفي — PDF\n"
+            "2️⃣ بنفس الترتيب\n"
+            "3️⃣ سطر بسطر\n"
+            "4️⃣ فوق الكلمات",
+            reply_markup=translation_menu(),
+        )
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+        except Exception:
+            pass
+
     async def _translate_media_job(
         context, chat_id: int, user_id: int, media_path: Path,
         user_dir: Path, direction: str, status_msg_id: int,
@@ -302,9 +379,29 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
         context, chat_id: int, user_id: int, file_path: Path,
         user_dir: Path, direction: str, status_msg_id: int,
     ):
+        if is_render_host():
+            await _translate_file_streaming(
+                context, chat_id, file_path, user_dir, direction, status_msg_id,
+            )
+            return
         await _translate_media_job(
             context, chat_id, user_id, file_path, user_dir, direction, status_msg_id,
             image=False, activity="translate_file",
+        )
+
+    async def _translate_image_job(
+        context, chat_id: int, user_id: int, image_path: Path,
+        user_dir: Path, direction: str, status_msg_id: int,
+    ):
+        if is_render_host():
+            await _translate_file_streaming(
+                context, chat_id, image_path, user_dir, direction, status_msg_id,
+                image=True,
+            )
+            return
+        await _translate_media_job(
+            context, chat_id, user_id, image_path, user_dir, direction, status_msg_id,
+            image=True, activity="translate_image",
         )
 
     async def wait_direction_media_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,7 +423,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             await update.message.reply_text("❌ أرسل ملفاً صالحاً (PDF / TXT / DOCX).")
             return states.TR_WAIT_FILE
 
-        suffix = Path(doc.file_name).suffix.lower()
+        safe_name = doc.file_name or f"upload_{doc.file_unique_id}.txt"
+        suffix = Path(safe_name).suffix.lower()
         if suffix not in (".pdf", ".txt", ".docx", ".doc"):
             await update.message.reply_text("❌ الملفات المدعومة: PDF, TXT, DOCX")
             return states.TR_WAIT_FILE
@@ -340,7 +438,7 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             "📌 الملفات الكبيرة تُترجم في الخلفية — يمكنك استخدام البوت بحرية."
         )
         user_dir = get_user_temp_dir(update.effective_user.id)
-        file_path = user_dir / doc.file_name
+        file_path = user_dir / safe_name
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
         direction = context.user_data.get("tr_direction", "auto")
@@ -371,8 +469,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
                 except asyncio.TimeoutError:
                     await context.bot.send_message(
                         chat_id,
-                        "❌ انتهت مهلة ترجمة الملف (60 دقيقة).\n"
-                        "جرّب ملفاً أصغر.",
+                        "❌ انتهت مهلة ترجمة الملف (15 دقيقة).\n"
+                        "جرّب ملفاً أصغر أو TXT.",
                         reply_markup=translation_menu(),
                     )
                 except (TimedOut, NetworkError):
@@ -451,15 +549,14 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
 
         async def _job():
             try:
-                await _translate_media_job(
+                await _translate_image_job(
                     context, chat_id, user_id, image_path,
                     user_dir, direction, status.message_id,
-                    image=True, activity="translate_image",
                 )
             except asyncio.TimeoutError:
                 await context.bot.send_message(
                     chat_id,
-                    "❌ انتهت مهلة ترجمة الصورة (60 دقيقة).\n"
+                    "❌ انتهت مهلة ترجمة الصورة (15 دقيقة).\n"
                     "جرّب صورة أصغر.",
                     reply_markup=translation_menu(),
                 )

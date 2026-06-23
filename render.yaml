@@ -33,7 +33,7 @@ services:
         value: "1"
       - key: FILE_TRANSLATE_FULL
         value: "1"
-      - key: FILE_TRANSLATE_LOCAL
+      - key: FILE_TRANSLATE_ONLINE
         value: "1"
       - key: SUPABASE_SECRET_KEY
         sync: false

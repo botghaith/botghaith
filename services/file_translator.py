@@ -6,6 +6,7 @@
 4) فوق الكلمات — نفس الملف مع ترجمة صغيرة فوق كل كلمة
 """
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -20,7 +21,7 @@ from docx.text.run import Run
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
 from services.translator import translate_text, resolve_direction, set_file_translation_mode, is_translator_ready
-from config import use_fast_file_translation, prefer_local_for_files
+from config import use_fast_file_translation, prefer_local_for_files, is_render_host, file_max_paragraphs
 from services.text_shape import (
     is_mostly_arabic,
     find_arabic_font,
@@ -315,11 +316,109 @@ def _build_overlay_online(
 def _paragraph_pairs(content: str, direction: str) -> list[tuple[str, str]]:
     direction = resolve_direction(content, direction)
     pairs: list[tuple[str, str]] = []
-    for unit in _extract_logical_units(content):
+    units = _extract_logical_units(content)
+    total = len(units)
+    for i, unit in enumerate(units, 1):
         unit = unit.strip()
-        if unit:
-            pairs.append((unit, translate_text(unit, direction)))
+        if not unit:
+            continue
+        if i % 5 == 0 or i == total:
+            logger.info("Translating paragraph %d/%d", i, total)
+        pairs.append((unit, translate_text(unit, direction)))
     return pairs
+
+
+def prepare_online_file_translation(source_path: Path, direction: str = "auto") -> dict:
+    """استخراج + ترجمة فقرات — الخطوة البطيئة."""
+    content = extract_text_from_file(source_path)
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الملف")
+    _check_file_limits(source_path, content)
+    direction = resolve_direction(content, direction)
+    pairs = _paragraph_pairs(content, direction)
+    if not pairs:
+        raise ValueError("لم يتم العثور على فقرات للترجمة")
+
+    truncated = False
+    limit = file_max_paragraphs()
+    if len(pairs) > limit:
+        pairs = pairs[:limit]
+        truncated = True
+        logger.warning("Truncated to %d paragraphs", limit)
+
+    return {
+        "content": content,
+        "direction": direction,
+        "pairs": pairs,
+        "stem": source_path.stem,
+        "source_path": source_path,
+        "truncated": truncated,
+    }
+
+
+def prepare_online_image_translation(image_path: Path, direction: str = "auto") -> dict:
+    from services.ocr_service import ocr_image
+
+    content = ocr_image(image_path)
+    if not content.strip():
+        raise ValueError("لم يتم العثور على نص في الصورة")
+    _check_file_limits(image_path, content)
+    direction = resolve_direction(content, direction)
+    pairs = _paragraph_pairs(content, direction)
+    if not pairs:
+        raise ValueError("لم يتم العثور على نص للترجمة في الصورة")
+
+    truncated = False
+    limit = file_max_paragraphs()
+    if len(pairs) > limit:
+        pairs = pairs[:limit]
+        truncated = True
+
+    return {
+        "content": content,
+        "direction": direction,
+        "pairs": pairs,
+        "stem": image_path.stem,
+        "source_path": image_path,
+        "truncated": truncated,
+        "is_image": True,
+    }
+
+
+def build_online_literal(data: dict, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return _build_literal_files_from_pairs(
+        data["pairs"], data["direction"], output_dir, data["stem"],
+    )["literal"]
+
+
+def build_online_structured(data: dict, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if data.get("is_image"):
+        path = output_dir / f"{data['stem']}_2_بنفس_الترتيب.pdf"
+        create_pairs_pdf(
+            data["pairs"], path,
+            title="ترجمة الصورة — أصل وترجمة",
+            direction=data["direction"],
+        )
+        return path
+    return _write_structured_online(
+        data["source_path"], data["pairs"], output_dir, data["stem"], data["direction"],
+    )
+
+
+def build_online_line_pairs(data: dict, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return _build_line_pairs_file(
+        data["content"], data["direction"], output_dir, data["stem"], pairs=data["pairs"],
+    )["line_pairs"]
+
+
+def build_online_overlay(data: dict, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return _build_overlay_online(
+        data["pairs"], output_dir, data["stem"], data["direction"],
+    )["overlay"]
 
 
 def _argos_available() -> bool:
@@ -981,6 +1080,9 @@ def translate_image_two_modes(
     if use_fast_file_translation():
         return translate_image_fast(image_path, output_dir, direction)
 
+    if is_render_host() or os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
+        return _translate_image_online_full(image_path, output_dir, direction)
+
     if _argos_available():
         set_file_translation_mode(True)
         try:
@@ -1032,6 +1134,10 @@ def translate_file_two_modes(
 ) -> dict[str, Path]:
     if use_fast_file_translation():
         return translate_file_fast(source_path, output_dir, direction)
+
+    # Render: مسار إنترنت فقط — Argos كلمة-بكلمة يعلق
+    if is_render_host() or os.getenv("FILE_TRANSLATE_ONLINE", "") == "1":
+        return _translate_file_online_full(source_path, output_dir, direction)
 
     if _argos_available():
         set_file_translation_mode(True)
