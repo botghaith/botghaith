@@ -21,7 +21,7 @@ from docx.text.run import Run
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
 from services.translator import translate_text, resolve_direction, set_file_translation_mode, is_translator_ready
-from config import use_fast_file_translation, prefer_local_for_files, is_render_host, file_max_paragraphs
+from config import use_fast_file_translation, prefer_local_for_files, is_render_host, file_max_paragraphs, use_dual_file_translation, use_full_file_translation
 from services.text_shape import (
     is_mostly_arabic,
     find_arabic_font,
@@ -38,7 +38,7 @@ MAX_FILE_MB = 50
 WORD_TOKEN_RE = re.compile(r"\S+")
 WORD_CHAR_RE = re.compile(r"[\w\u0600-\u06FF]", re.UNICODE)
 _word_cache: dict[tuple[str, str], str] = {}
-_WORD_BATCH_SIZE = 25
+_WORD_BATCH_SIZE = 40
 
 
 def _clear_word_cache():
@@ -1206,17 +1206,67 @@ def translate_image_fast(
     return _build_fast_outputs(pairs, output_dir, stem, direction)
 
 
+def prepare_dual_file_translation(
+    source_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict:
+    data = prepare_full_file_translation(source_path, output_dir, direction)
+    set_file_translation_mode(True)
+    logger.info("Prewarming Argos cache for fast overlay...")
+    _prewarm_word_cache_for_text(data["content"], data["direction"])
+    return data
+
+
+def prepare_dual_image_translation(
+    image_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict:
+    data = prepare_full_image_translation(image_path, output_dir, direction)
+    set_file_translation_mode(True)
+    logger.info("Prewarming Argos cache for fast overlay...")
+    _prewarm_word_cache_for_text(data["content"], data["direction"])
+    return data
+
+
+def translate_file_dual_modes(
+    source_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
+    """ملفان فقط: بنفس الترتيب + فوق الكلمات — Argos محلي سريع."""
+    set_file_translation_mode(True)
+    try:
+        data = prepare_dual_file_translation(source_path, output_dir, direction)
+        logger.info("Dual file translation (2 files): %s", source_path.name)
+        structured = build_full_file_structured(data)
+        overlay = build_full_file_overlay(data)
+        return {"structured": structured, "overlay": overlay}
+    finally:
+        set_file_translation_mode(False)
+
+
+def translate_image_dual_modes(
+    image_path: Path, output_dir: Path, direction: str = "auto",
+) -> dict[str, Path]:
+    set_file_translation_mode(True)
+    try:
+        data = prepare_dual_image_translation(image_path, output_dir, direction)
+        logger.info("Dual image translation (2 files): %s", image_path.name)
+        structured = build_full_image_structured(data)
+        overlay = build_full_image_overlay(data)
+        return {"structured": structured, "overlay": overlay}
+    finally:
+        set_file_translation_mode(False)
+
+
 def translate_image_two_modes(
     image_path: Path, output_dir: Path, direction: str = "auto"
 ) -> dict[str, Path]:
     if use_fast_file_translation():
         return translate_image_fast(image_path, output_dir, direction)
-
-    set_file_translation_mode(True)
-    try:
-        return _translate_image_full(image_path, output_dir, direction)
-    finally:
-        set_file_translation_mode(False)
+    if use_full_file_translation():
+        set_file_translation_mode(True)
+        try:
+            return _translate_image_full(image_path, output_dir, direction)
+        finally:
+            set_file_translation_mode(False)
+    return translate_image_dual_modes(image_path, output_dir, direction)
 
 
 def _translate_image_full(
@@ -1259,12 +1309,13 @@ def translate_file_two_modes(
 ) -> dict[str, Path]:
     if use_fast_file_translation():
         return translate_file_fast(source_path, output_dir, direction)
-
-    set_file_translation_mode(True)
-    try:
-        return _translate_file_full(source_path, output_dir, direction)
-    finally:
-        set_file_translation_mode(False)
+    if use_full_file_translation():
+        set_file_translation_mode(True)
+        try:
+            return _translate_file_full(source_path, output_dir, direction)
+        finally:
+            set_file_translation_mode(False)
+    return translate_file_dual_modes(source_path, output_dir, direction)
 
 
 def _translate_file_full(

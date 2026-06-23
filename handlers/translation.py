@@ -13,15 +13,11 @@ from services.channel_check import check_channel_for_translation
 from services.file_translator import (
     translate_file_two_modes,
     translate_image_two_modes,
-    prepare_full_file_translation,
-    prepare_full_image_translation,
-    build_full_file_literal,
+    prepare_dual_file_translation,
+    prepare_dual_image_translation,
     build_full_file_structured,
-    build_full_file_line_pairs,
     build_full_file_overlay,
-    build_full_image_literal,
     build_full_image_structured,
-    build_full_image_line_pairs,
     build_full_image_overlay,
 )
 from config import use_online_translate
@@ -74,8 +70,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             f"📚 **قسم الترجمة**\n{ready}\n\n"
             "اختر نوع الترجمة:\n"
             "• **نص** — ترجمة فورية مع عرض ثنائي اللغة\n"
-            "• **ملف** — 4 ملفات: حرفي PDF / بنفس الترتيب / سطر بسطر / فوق الكلمات\n"
-            "• **صورة** — نفس 4 صيغ بعد استخراج النص بـ OCR",
+            "• **ملف** — ملفان: بنفس الترتيب + فوق الكلمات (سريع ومحلي)\n"
+            "• **صورة** — نفس الملفين بعد استخراج النص",
             parse_mode="Markdown",
             reply_markup=translation_menu(),
         )
@@ -276,36 +272,30 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
         context, chat_id: int, file_path: Path, user_dir: Path,
         direction: str, status_msg_id: int, *, image: bool = False,
     ):
-        """4 ملفات بالمواصفات الأصلية — إرسال كل ملف فور جاهزيته."""
+        """ملفان: بنفس الترتيب + فوق الكلمات — Argos محلي."""
         captions = {
-            "literal": "1️⃣ حرفي — PDF (كلمة وترجمتها بجانب بعض)",
-            "structured": "2️⃣ نفس ترتيب الصورة/الملف — مترجم بالكامل",
-            "line_pairs": "3️⃣ سطر بسطر — كل سطر وترجمته تحته",
-            "overlay": "4️⃣ فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
+            "structured": "1️⃣ بنفس ترتيب الملف — مترجم بالكامل",
+            "overlay": "2️⃣ فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
         }
         if image:
-            prepare_fn = prepare_full_image_translation
+            prepare_fn = prepare_dual_image_translation
             steps = [
-                ("literal", build_full_image_literal, "⏳ جاري إنشاء الملف 1 (حرفي — كلمة بكلمة)..."),
-                ("structured", build_full_image_structured, "⏳ جاري إنشاء الملف 2 (بنفس ترتيب الصورة)..."),
-                ("line_pairs", build_full_image_line_pairs, "⏳ جاري إنشاء الملف 3 (سطر بسطر)..."),
-                ("overlay", build_full_image_overlay, "⏳ جاري إنشاء الملف 4 (فوق الكلمات)..."),
+                ("structured", build_full_image_structured, "⏳ الملف 1: ترجمة بنفس ترتيب الصورة..."),
+                ("overlay", build_full_image_overlay, "⏳ الملف 2: ترجمة فوق الكلمات..."),
             ]
         else:
-            prepare_fn = prepare_full_file_translation
+            prepare_fn = prepare_dual_file_translation
             steps = [
-                ("literal", build_full_file_literal, "⏳ جاري إنشاء الملف 1 (حرفي — كلمة بكلمة)..."),
-                ("structured", build_full_file_structured, "⏳ جاري إنشاء الملف 2 (بنفس ترتيب الملف)..."),
-                ("line_pairs", build_full_file_line_pairs, "⏳ جاري إنشاء الملف 3 (سطر بسطر)..."),
-                ("overlay", build_full_file_overlay, "⏳ جاري إنشاء الملف 4 (فوق الكلمات)..."),
+                ("structured", build_full_file_structured, "⏳ الملف 1: ترجمة بنفس ترتيب الملف..."),
+                ("overlay", build_full_file_overlay, "⏳ الملف 2: ترجمة فوق الكلمات..."),
             ]
         label = "الصورة" if image else "الملف"
 
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg_id,
-            text="⏳ جاري تحليل النص وتجهيز محرك الترجمة...\n"
-            "📌 سيصلك كل ملف بالترتيب فور اكتماله.",
+            text="⏳ جاري تحميل محرك Argos المحلي...\n"
+            "🔒 ترجمة مباشرة على Render — بدون إنترنت.",
         )
         data = await asyncio.wait_for(
             asyncio.to_thread(prepare_fn, file_path, user_dir, direction),
@@ -324,11 +314,9 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
 
         await context.bot.send_message(
             chat_id,
-            f"✅ تم إرسال 4 ملفات ترجمة {label}!\n\n"
-            "1️⃣ حرفي — كلمة + ترجمتها\n"
-            "2️⃣ بنفس الترتيب — الملف مترجم\n"
-            "3️⃣ سطر بسطر — أصل + ترجمة\n"
-            "4️⃣ فوق الكلمات — ترجمة فوق كل كلمة",
+            f"✅ تم إرسال ملفي ترجمة {label}!\n\n"
+            "1️⃣ بنفس الترتيب — الملف كاملاً مترجم\n"
+            "2️⃣ فوق الكلمات — ترجمة فوق كل كلمة بدون تغيير الشكل",
             reply_markup=translation_menu(),
         )
         try:

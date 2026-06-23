@@ -30,8 +30,21 @@ def use_online_translate() -> bool:
 
 
 def use_fast_file_translation() -> bool:
-    """الوضع السريع (ملفان فقط) — اختياري. الافتراضي: 4 ملفات كاملة."""
+    """قديم — ملفان نص/PDF مبسّط."""
     return os.getenv("FILE_TRANSLATE_FAST", "") == "1"
+
+
+def file_translation_mode() -> str:
+    """dual = ملفان (بنفس الترتيب + فوق الكلمات) | full = 4 ملفات"""
+    return os.getenv("FILE_TRANSLATE_MODE", "dual")
+
+
+def use_dual_file_translation() -> bool:
+    return file_translation_mode() == "dual"
+
+
+def use_full_file_translation() -> bool:
+    return file_translation_mode() == "full" or os.getenv("FILE_TRANSLATE_FULL", "") == "1"
 
 
 def translation_use_supabase() -> bool:
