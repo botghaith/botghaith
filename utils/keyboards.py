@@ -5,10 +5,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["📚 الترجمة", "📄 أدوات PDF"],
-        ["📝 الامتحانات", "🧑‍🎓 حسابي"],
-        ["ℹ️ المساعدة"],
+        ["📋 واجهة تقرير", "📝 الامتحانات"],
+        ["🧑‍🎓 حسابي", "ℹ️ المساعدة"],
+        ["🛡️ حماية الكروبات"],
     ],
     resize_keyboard=True,
+    is_persistent=True,
 )
 
 ADMIN_MENU = ReplyKeyboardMarkup(
@@ -19,6 +21,7 @@ ADMIN_MENU = ReplyKeyboardMarkup(
         ["❓ الأسئلة الجاهزة", "➕ سؤال جديد"],
         ["📢 إشعار جماعي", "📺 إدارة القنوات"],
         ["📜 سجل النشاط", "🛠️ حالة الخدمات"],
+        ["🛡️ قنوات الحماية"],
         ["🏠 القائمة الرئيسية"],
     ],
     resize_keyboard=True,
@@ -31,6 +34,7 @@ def translation_menu() -> ReplyKeyboardMarkup:
         [
             ["📝 ترجمة نص", "📁 ترجمة ملف"],
             ["🖼️ ترجمة صورة", "🔙 القائمة الرئيسية"],
+            ["🔠 صغير", "🔠 متوسط", "🔠 كبير"],
         ],
         resize_keyboard=True,
     )
@@ -55,6 +59,19 @@ def translation_direction_reply_menu() -> ReplyKeyboardMarkup:
     )
 
 
+def translation_color_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬛ أسود", callback_data="tr_color_black"),
+            InlineKeyboardButton("🔴 أحمر", callback_data="tr_color_red"),
+        ],
+        [
+            InlineKeyboardButton("🔵 أزرق", callback_data="tr_color_blue"),
+            InlineKeyboardButton("🟢 أخضر", callback_data="tr_color_green"),
+        ],
+    ])
+
+
 _DIRECTION_FROM_TEXT = {
     "عربي → إنجليزي": "ar_en",
     "إنجليزي → عربي": "en_ar",
@@ -74,10 +91,12 @@ def pdf_menu() -> ReplyKeyboardMarkup:
             ["📄 Word → PDF", "📝 PDF → Word"],
             ["🔗 دمج PDF", "✂️ تقسيم PDF"],
             ["🗜️ ضغط PDF", "📖 استخراج نص"],
-            ["🔄 إعادة ترتيب", "🔙 القائمة الرئيسية"],
+            ["🔄 إعادة ترتيب", "📑 دمج سلايدات"],
+            ["🔙 القائمة الرئيسية"],
         ],
         resize_keyboard=True,
     )
+
 
 # ── Exams ──
 
@@ -247,6 +266,140 @@ def admin_exam_actions_keyboard(exam_id: str, is_active: bool) -> InlineKeyboard
     if is_active:
         rows.append([InlineKeyboardButton("⛔ إيقاف الامتحان", callback_data=f"adm_exam_off_{exam_id}")])
     rows.append([InlineKeyboardButton("🔙 قائمة الامتحانات", callback_data="adm_exams_list")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _user_button_label(seq: int, user: dict) -> str:
+    name = (user.get("full_name") or "").strip() or "بدون اسم"
+    uname = (user.get("username") or "").strip().lstrip("@")
+    label = f"{seq}. {name}"
+    if uname:
+        label += f" @{uname}"
+    return label[:64]
+
+
+def admin_users_page_keyboard(
+    users: list, page: int, page_size: int = 8,
+) -> InlineKeyboardMarkup:
+    total = len(users)
+    pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    page = max(0, min(page, pages - 1))
+    start = page * page_size
+    rows = []
+    for seq, user in enumerate(users[start:start + page_size], start + 1):
+        rows.append([
+            InlineKeyboardButton(
+                _user_button_label(seq, user),
+                callback_data=f"adm_um_{user['user_id']}_{page}",
+            )
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ السابق", callback_data=f"adm_up_{page - 1}"))
+    if start + page_size < total:
+        nav.append(InlineKeyboardButton("التالي ▶️", callback_data=f"adm_up_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔍 بحث", callback_data="adm_users_search")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_user_chat_keyboard(
+    user_id: int,
+    msg_page: int,
+    msg_pages: int,
+    list_page: int,
+    prev_user: tuple[int, int] | None,
+    next_user: tuple[int, int] | None,
+) -> InlineKeyboardMarkup:
+    rows = []
+    people = []
+    if prev_user:
+        people.append(InlineKeyboardButton(
+            "👤 السابق", callback_data=f"adm_um_{prev_user[0]}_{prev_user[1]}",
+        ))
+    if next_user:
+        people.append(InlineKeyboardButton(
+            "التالي 👤", callback_data=f"adm_um_{next_user[0]}_{next_user[1]}",
+        ))
+    if people:
+        rows.append(people)
+    pages = []
+    if msg_page < msg_pages - 1:
+        pages.append(InlineKeyboardButton(
+            "◀️ أقدم", callback_data=f"adm_uc_{user_id}_{msg_page + 1}_{list_page}",
+        ))
+    if msg_page > 0:
+        pages.append(InlineKeyboardButton(
+            "أحدث ▶️", callback_data=f"adm_uc_{user_id}_{msg_page - 1}_{list_page}",
+        ))
+    if pages:
+        rows.append(pages)
+    rows.append([
+        InlineKeyboardButton("🔙 المستخدمون", callback_data=f"adm_up_{list_page}"),
+        InlineKeyboardButton("🔍 بحث", callback_data="adm_users_search"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_user_search_keyboard(users: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for user in users[:10]:
+        name = (user.get("full_name") or "").strip() or "بدون اسم"
+        rows.append([
+            InlineKeyboardButton(
+                f"👤 {name}"[:64],
+                callback_data=f"adm_um_{user['user_id']}_0",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("👥 القائمة", callback_data="adm_up_0"),
+        InlineKeyboardButton("🔍 بحث", callback_data="adm_users_search"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_users_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 قائمة المستخدمين", callback_data="adm_up_0"),
+            InlineKeyboardButton("🔍 بحث", callback_data="adm_users_search"),
+        ],
+    ])
+
+
+def guard_input_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["✅ تم"], ["🔙 القائمة الرئيسية"]],
+        resize_keyboard=True,
+    )
+
+
+def guard_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ إضافة قنوات مسموحة", callback_data="gg_add")],
+        [InlineKeyboardButton("📋 القنوات المسموحة", callback_data="gg_list")],
+    ])
+
+
+def guard_groups_keyboard(groups: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for group in groups[:20]:
+        title = (group.get("title") or "كروب").strip() or "كروب"
+        rows.append([
+            InlineKeyboardButton(title[:40], callback_data=f"gg_pick_{group['chat_id']}")
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def guard_channel_delete_keyboard(
+    rows_data: list[tuple[str, str]], *, with_add: bool = True,
+) -> InlineKeyboardMarkup:
+    rows = []
+    for label, data in rows_data:
+        rows.append([InlineKeyboardButton(label[:64], callback_data=data)])
+    if with_add:
+        rows.append([InlineKeyboardButton("➕ إضافة قنوات", callback_data="gg_add")])
     return InlineKeyboardMarkup(rows)
 
 

@@ -9,17 +9,26 @@ import logging
 import os
 import sys
 
+from telegram import Update
 from telegram.error import Conflict
-from telegram.ext import Application
+from telegram.ext import Application, TypeHandler
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR
-from config import BOT_TOKEN, is_supabase_enabled, prefer_local_for_files
+from config import (
+    BOT_TOKEN,
+    prefer_local_for_files,
+    telegram_connect_timeout,
+    telegram_read_timeout,
+    telegram_write_timeout,
+)
 from database import get_database
 from handlers.admin import setup_admin_handlers
+from handlers.group_guard import setup_group_guard_handlers
 from handlers.exams import setup_exam_handlers
 from handlers.pdf_tools import setup_pdf_handlers
 from handlers.start import setup_start_handlers
 from handlers.student import setup_student_handlers
+from handlers.report_cover import setup_report_cover_handlers
 from handlers.translation import setup_translation_handlers
 from setup_translate import install_translation_packages
 from services.translator import is_translator_ready
@@ -54,9 +63,9 @@ def create_application(db) -> Application:
         .token(BOT_TOKEN)
         .post_init(post_init)
         .concurrent_updates(True)
-        .connect_timeout(120.0)
-        .read_timeout(600.0)
-        .write_timeout(600.0)
+        .connect_timeout(telegram_connect_timeout())
+        .read_timeout(telegram_read_timeout())
+        .write_timeout(telegram_write_timeout())
         .get_updates_read_timeout(60.0)
         .build()
     )
@@ -73,10 +82,21 @@ def create_application(db) -> Application:
 
     app.add_error_handler(on_error)
 
+    async def remember_user(update: Update, context):
+        user = update.effective_user
+        if user:
+            try:
+                db.upsert_user(user.id, user.username or "", user.full_name or "")
+            except Exception:
+                logger.warning("Failed to remember user %s", getattr(user, "id", "?"))
+
+    app.add_handler(TypeHandler(Update, remember_user), group=-2)
+
     for handler in start_handlers:
         app.add_handler(handler, group=-1)
 
-    app.add_handler(setup_translation_handlers(back_to_main))
+    app.add_handler(setup_translation_handlers(db, back_to_main))
+    app.add_handler(setup_report_cover_handlers(db, back_to_main))
     app.add_handler(setup_pdf_handlers(db, back_to_main))
 
     for handler in setup_exam_handlers(db, back_to_main):
@@ -87,6 +107,12 @@ def create_application(db) -> Application:
 
     for handler in setup_admin_handlers(db, back_to_main):
         app.add_handler(handler)
+
+    guard_handlers, guard_watchers = setup_group_guard_handlers(db, back_to_main)
+    for handler in guard_handlers:
+        app.add_handler(handler)
+    for handler in guard_watchers:
+        app.add_handler(handler, group=-1)
 
     return app
 
@@ -99,7 +125,7 @@ def main() -> None:
     db = get_database()
 
     app = create_application(db)
-    backend = "Supabase" if is_supabase_enabled() else "SQLite"
+    backend = getattr(db, "backend", type(db).__name__)
     host = "Render (24/7)" if os.getenv("RENDER") else "Local (جهازك)"
     logger.info("🎓 البوت يعمل — %s | %s | إعداد المهندس غيث اسعد", host, backend)
     app.run_polling(drop_pending_updates=True)

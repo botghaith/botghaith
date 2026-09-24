@@ -15,7 +15,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 from docx.text.run import Run
 
 from services.file_extractor import extract_text_from_file
@@ -29,6 +29,9 @@ from services.text_shape import (
     set_run_font,
     set_paragraph_direction,
     style_paragraph,
+    scaled_pt,
+    font_scale,
+    translation_color_rgb,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,7 +46,6 @@ _WORD_BATCH_SIZE = 40
 
 def _clear_word_cache():
     _word_cache.clear()
-
 
 def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
     """ترجمة الكلمات الفريدة دفعة واحدة — أسرع بكثير من كلمة/طلب."""
@@ -487,6 +489,13 @@ OVERLAY_WORD_SIZE = 11
 OVERLAY_LINE_SPACING = 0.85
 
 
+def _colorize_overlay_run(run):
+    r, g, b = translation_color_rgb()
+    run.font.color.rgb = RGBColor(
+        int(round(r * 255)), int(round(g * 255)), int(round(b * 255)),
+    )
+
+
 def _paragraph_has_image(para) -> bool:
     for run in para.runs:
         if run._element.xpath(".//w:drawing") or run._element.xpath(".//w:pict"):
@@ -567,8 +576,10 @@ def _pdf_insert_translation_above(page, x0, y0, x1, y1, text: str, fontfile: str
     display = shape_for_pdf(text) if has_arabic(text) else text
     word_w = max(x1 - x0, 3)
     word_h = max(y1 - y0, 3)
-    fs = min(OVERLAY_TR_SIZE_PDF, word_h * 0.42)
-    fs = max(fs, 5.5)
+    scale = font_scale()
+    requested = scaled_pt(OVERLAY_TR_SIZE_PDF)
+    fs = min(requested, word_h * 0.42 * scale)
+    fs = max(fs, scaled_pt(5.2, 3.8))
 
     font_kwargs = {}
     if fontfile:
@@ -582,7 +593,9 @@ def _pdf_insert_translation_above(page, x0, y0, x1, y1, text: str, fontfile: str
             return len(display) * size * 0.45
 
     tw = _text_width(fs)
-    while tw > word_w * 1.05 and fs > 4.0:
+    max_w = word_w * (1.08 + 0.22 * max(0.0, scale - 1.0))
+    min_fs = scaled_pt(4.2, 3.4)
+    while tw > max_w and fs > min_fs:
         fs -= 0.15
         tw = _text_width(fs)
 
@@ -591,9 +604,9 @@ def _pdf_insert_translation_above(page, x0, y0, x1, y1, text: str, fontfile: str
     y = y0 + fs * 0.12
 
     try:
-        page.insert_text((x, y), display, fontsize=fs, **font_kwargs)
+        page.insert_text((x, y), display, fontsize=fs, color=translation_color_rgb(), **font_kwargs)
     except Exception:
-        page.insert_text((x, y), display, fontsize=fs)
+        page.insert_text((x, y), display, fontsize=fs, color=translation_color_rgb())
 
 
 def _run_has_image(run) -> bool:
@@ -612,9 +625,11 @@ def _add_overlay_runs_at_index(
             insert_idx += 1
             tr_run = Run(r, para)
             tr_run.text = tr
-            set_run_font(tr_run, "Tahoma", OVERLAY_TR_SIZE)
+            tr_sz = scaled_pt(OVERLAY_TR_SIZE)
+            set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
             tr_run.font.superscript = True
-            tr_run.font.size = Pt(OVERLAY_TR_SIZE)
+            tr_run.font.size = Pt(tr_sz)
+            _colorize_overlay_run(tr_run)
             r = OxmlElement("w:r")
             parent.insert(insert_idx, r)
             insert_idx += 1
@@ -679,14 +694,16 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
         if WORD_CHAR_RE.search(token):
             tr = translate_word_in_context(token, text, direction)
             tr_run = p.add_run(tr)
-            set_run_font(tr_run, "Tahoma", OVERLAY_TR_SIZE)
+            tr_sz = scaled_pt(OVERLAY_TR_SIZE)
+            set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
+            _colorize_overlay_run(tr_run)
             br_run = p.add_run()
             br_run.add_break()
 
         w_run = p.add_run(token)
         set_run_font(w_run, "Tahoma", OVERLAY_WORD_SIZE)
 
-    row_h = OVERLAY_TR_SIZE + OVERLAY_WORD_SIZE + 1
+    row_h = scaled_pt(OVERLAY_TR_SIZE) + OVERLAY_WORD_SIZE + 1
     _set_row_exact_height(table.rows[0], row_h)
 
     tbl_element = table._tbl
@@ -759,7 +776,7 @@ def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
 
 
 def _build_overlay_file(
-    source_path: Path, out_dir: Path, stem: str, direction: str, content: str
+    source_path: Path, out_dir: Path, stem: str, direction: str, content: str,
 ) -> dict[str, Path]:
     direction = resolve_direction(content, direction)
     suffix = source_path.suffix.lower()
@@ -790,20 +807,21 @@ def _build_overlay_file(
 
 
 def _set_paragraph_translated(para, translated: str, direction: str):
+    sz = max(8, int(round(scaled_pt(12))))
     placed = False
     for run in para.runs:
         if run._element.xpath(".//w:drawing") or run._element.xpath(".//w:pict"):
             continue
         if not placed:
             run.text = translated
-            set_run_font(run, "Tahoma", 12)
+            set_run_font(run, "Tahoma", sz)
             placed = True
         else:
             run.text = ""
     if not placed:
         run = para.add_run(translated)
-        set_run_font(run, "Tahoma", 12)
-    style_paragraph(para, translated, direction)
+        set_run_font(run, "Tahoma", sz)
+    style_paragraph(para, translated, direction, base_size=sz)
 
 
 def _process_docx_paragraphs(doc: Document, direction: str):
@@ -904,7 +922,7 @@ def _build_structured_pdf(source: Path, out_path: Path, direction: str) -> None:
 
         for rect, new_text, size, rtl in text_jobs:
             pad = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 40, rect.y1 + size * 3)
-            _pdf_write_in_box(new_page, pad, new_text, size, fontfile, rtl)
+            _pdf_write_in_box(new_page, pad, new_text, scaled_pt(size), fontfile, rtl)
 
     out_doc.save(str(out_path))
     out_doc.close()
@@ -1103,7 +1121,7 @@ def _translate_image_structured(
 
     for rect, new_text, size, rtl in text_jobs:
         pad = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 40, rect.y1 + size * 2.5)
-        _pdf_write_in_box(page, pad, new_text, size, fontfile, rtl)
+        _pdf_write_in_box(page, pad, new_text, scaled_pt(size), fontfile, rtl)
 
     doc.save(str(out_path))
     doc.close()
@@ -1209,21 +1227,13 @@ def translate_image_fast(
 def prepare_dual_file_translation(
     source_path: Path, output_dir: Path, direction: str = "auto",
 ) -> dict:
-    data = prepare_full_file_translation(source_path, output_dir, direction)
-    set_file_translation_mode(True)
-    logger.info("Prewarming Argos cache for fast overlay...")
-    _prewarm_word_cache_for_text(data["content"], data["direction"])
-    return data
+    return prepare_full_file_translation(source_path, output_dir, direction)
 
 
 def prepare_dual_image_translation(
     image_path: Path, output_dir: Path, direction: str = "auto",
 ) -> dict:
-    data = prepare_full_image_translation(image_path, output_dir, direction)
-    set_file_translation_mode(True)
-    logger.info("Prewarming Argos cache for fast overlay...")
-    _prewarm_word_cache_for_text(data["content"], data["direction"])
-    return data
+    return prepare_full_image_translation(image_path, output_dir, direction)
 
 
 def translate_file_dual_modes(
@@ -1233,10 +1243,9 @@ def translate_file_dual_modes(
     set_file_translation_mode(True)
     try:
         data = prepare_dual_file_translation(source_path, output_dir, direction)
-        logger.info("Dual file translation (2 files): %s", source_path.name)
-        structured = build_full_file_structured(data)
+        logger.info("Dual file translation (overlay): %s", source_path.name)
         overlay = build_full_file_overlay(data)
-        return {"structured": structured, "overlay": overlay}
+        return {"overlay": overlay}
     finally:
         set_file_translation_mode(False)
 
@@ -1247,10 +1256,9 @@ def translate_image_dual_modes(
     set_file_translation_mode(True)
     try:
         data = prepare_dual_image_translation(image_path, output_dir, direction)
-        logger.info("Dual image translation (2 files): %s", image_path.name)
-        structured = build_full_image_structured(data)
+        logger.info("Dual image translation (overlay): %s", image_path.name)
         overlay = build_full_image_overlay(data)
-        return {"structured": structured, "overlay": overlay}
+        return {"overlay": overlay}
     finally:
         set_file_translation_mode(False)
 

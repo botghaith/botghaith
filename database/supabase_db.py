@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 class SupabaseDatabase:
     """PostgreSQL عبر Supabase — نفس واجهة Database المحلية."""
 
+    backend = "Supabase"
+
     def __init__(self):
         self.client = get_supabase()
         self._bootstrap()
@@ -24,6 +26,7 @@ class SupabaseDatabase:
                 "Supabase bootstrap failed — نفّذ database/supabase_schema.sql في SQL Editor: %s",
                 exc,
             )
+            raise
 
     def _normalize_channel_username(self, username: str) -> str:
         u = (username or "").strip()
@@ -147,8 +150,15 @@ class SupabaseDatabase:
     # ── Users ──
 
     def upsert_user(self, user_id: int, username: str = "", full_name: str = ""):
+        username = (username or "").strip().lstrip("@")
+        full_name = (full_name or "").strip()
+        existing = self.get_user(user_id) or {}
         self.client.table("users").upsert(
-            {"user_id": user_id, "username": username, "full_name": full_name},
+            {
+                "user_id": user_id,
+                "username": username or existing.get("username") or "",
+                "full_name": full_name or existing.get("full_name") or "",
+            },
             on_conflict="user_id",
         ).execute()
 
@@ -174,7 +184,41 @@ class SupabaseDatabase:
         return rows.data or []
 
     def get_all_users(self) -> list[dict]:
-        rows = self.client.table("users").select("*").order("created_at", desc=True).execute()
+        all_users: list[dict] = []
+        page_size = 1000
+        offset = 0
+        while True:
+            rows = (
+                self.client.table("users")
+                .select("*")
+                .order("created_at", desc=False)
+                .order("user_id", desc=False)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = rows.data or []
+            all_users.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return all_users
+
+    def search_users(self, query: str) -> list[dict]:
+        q = (query or "").strip().lstrip("@")
+        if not q:
+            return []
+        if q.isdigit():
+            user = self.get_user(int(q))
+            return [user] if user else []
+        safe = q.replace(",", " ").replace("(", " ").replace(")", " ")
+        rows = (
+            self.client.table("users")
+            .select("*")
+            .or_(f"username.ilike.%{safe}%,full_name.ilike.%{safe}%")
+            .order("created_at", desc=False)
+            .order("user_id", desc=False)
+            .execute()
+        )
         return rows.data or []
 
     def get_user_count(self) -> int:
@@ -405,6 +449,138 @@ class SupabaseDatabase:
             d["full_name"] = u.get("full_name", "")
             result.append(d)
         return result
+
+    def count_user_activities(self, user_id: int) -> int:
+        row = (
+            self.client.table("activity_log")
+            .select("id", count="exact")
+            .eq("user_id", user_id)
+            .limit(0)
+            .execute()
+        )
+        return row.count or 0
+
+    def get_user_activities(self, user_id: int, limit: int = 8, offset: int = 0) -> list[dict]:
+        rows = (
+            self.client.table("activity_log")
+            .select("action, details, created_at")
+            .eq("user_id", user_id)
+            .order("id", desc=True)
+            .range(offset, offset + max(limit, 1) - 1)
+            .execute()
+        )
+        return rows.data or []
+
+    # ── Group protection (داخل settings الموجودة، بدون جداول جديدة) ──
+
+    def _guard_load(self, key: str, default):
+        raw = self.get_setting(key, "")
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return default
+
+    def _guard_save(self, key: str, value) -> None:
+        self.set_setting(key, json.dumps(value, ensure_ascii=False))
+
+    def save_protected_group(self, chat_id: int, title: str, owner_id: int, is_active: bool = True):
+        groups = self._guard_load("guard_groups", {})
+        current = groups.get(str(chat_id), {})
+        groups[str(chat_id)] = {
+            "chat_id": chat_id,
+            "title": title or current.get("title") or "",
+            "owner_id": owner_id or current.get("owner_id") or 0,
+            "is_active": 1 if is_active else 0,
+        }
+        self._guard_save("guard_groups", groups)
+
+    def get_protected_group(self, chat_id: int) -> Optional[dict]:
+        return self._guard_load("guard_groups", {}).get(str(chat_id))
+
+    def list_groups_by_owner(self, owner_id: int) -> list[dict]:
+        groups = [
+            g for g in self._guard_load("guard_groups", {}).values()
+            if g.get("owner_id") == owner_id and g.get("is_active", 1)
+        ]
+        return sorted(groups, key=lambda g: g.get("title") or "")
+
+    def _next_guard_id(self, rows: list[dict]) -> int:
+        return max((int(row.get("id") or 0) for row in rows), default=0) + 1
+
+    def add_group_channel(self, chat_id: int, username: str, channel_id: int | None, title: str = ""):
+        data = self._guard_load("guard_group_channels", {})
+        rows = data.get(str(chat_id), [])
+        for row in rows:
+            if row.get("username") == username:
+                row["channel_id"] = channel_id
+                row["title"] = title or ""
+                data[str(chat_id)] = rows
+                self._guard_save("guard_group_channels", data)
+                return
+        all_rows = [item for bucket in data.values() for item in bucket]
+        rows.append({
+            "id": self._next_guard_id(all_rows),
+            "chat_id": chat_id,
+            "username": username,
+            "channel_id": channel_id,
+            "title": title or "",
+        })
+        data[str(chat_id)] = rows
+        self._guard_save("guard_group_channels", data)
+
+    def remove_group_channel(self, row_id: int) -> None:
+        data = self._guard_load("guard_group_channels", {})
+        for key, rows in data.items():
+            data[key] = [row for row in rows if int(row.get("id") or 0) != row_id]
+        self._guard_save("guard_group_channels", data)
+
+    def list_group_channels(self, chat_id: int) -> list[dict]:
+        rows = self._guard_load("guard_group_channels", {}).get(str(chat_id), [])
+        return sorted(rows, key=lambda row: row.get("username") or "")
+
+    def get_group_channel(self, row_id: int) -> Optional[dict]:
+        for rows in self._guard_load("guard_group_channels", {}).values():
+            for row in rows:
+                if int(row.get("id") or 0) == row_id:
+                    return row
+        return None
+
+    def add_global_channel(self, username: str, channel_id: int | None, title: str = ""):
+        rows = self._guard_load("guard_global_channels", [])
+        for row in rows:
+            if row.get("username") == username:
+                row["channel_id"] = channel_id
+                row["title"] = title or ""
+                self._guard_save("guard_global_channels", rows)
+                return
+        rows.append({
+            "id": self._next_guard_id(rows),
+            "username": username,
+            "channel_id": channel_id,
+            "title": title or "",
+        })
+        self._guard_save("guard_global_channels", rows)
+
+    def remove_global_channel(self, row_id: int) -> None:
+        rows = [
+            row for row in self._guard_load("guard_global_channels", [])
+            if int(row.get("id") or 0) != row_id
+        ]
+        self._guard_save("guard_global_channels", rows)
+
+    def list_global_channels(self) -> list[dict]:
+        return sorted(
+            self._guard_load("guard_global_channels", []),
+            key=lambda row: row.get("username") or "",
+        )
+
+    def get_global_channel(self, row_id: int) -> Optional[dict]:
+        for row in self._guard_load("guard_global_channels", []):
+            if int(row.get("id") or 0) == row_id:
+                return row
+        return None
 
     # ── Stats ──
 

@@ -15,9 +15,13 @@ from database.db import Database
 from services.channel_check import check_channel_subscription
 from services.exam_ui import format_exam_preview_for_student, format_student_result, format_creator_stats
 from services.exam_export import export_results_csv, export_results_pdf
-from utils.helpers import format_percentage, generate_exam_id, get_user_temp_dir, build_exam_link, parse_exam_id_from_start
+from services.exam_parser import (
+    parse_mcq_batch, format_question_block, EXAMPLE_MCQ, option_letter,
+)
+from utils.helpers import format_percentage, generate_exam_id, get_user_temp_dir, build_exam_link, parse_exam_id_from_start, split_text_chunks
 from utils.keyboards import exam_menu, exam_start_keyboard, exam_creator_results_keyboard, MAIN_MENU
 from utils import states
+from utils.activity_log import log_user_activity
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +68,80 @@ def _after_question_kb():
             InlineKeyboardButton("✅ نشر", callback_data="pq_done"),
         ],
     ])
+
+
+def _review_keyboard(n: int, page: int = 0, page_size: int = 20) -> InlineKeyboardMarkup:
+    start = page * page_size
+    end = min(n, start + page_size)
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in range(start, end):
+        row.append(InlineKeyboardButton(str(i + 1), callback_data=f"eqb_v_{i}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"eqb_p_{page - 1}"))
+    if end < n:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"eqb_p_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton("➕ المزيد", callback_data="eqb_more"),
+        InlineKeyboardButton("✅ نشر", callback_data="pq_done"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _question_edit_kb(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ تعديل", callback_data=f"eqb_e_{index}"),
+            InlineKeyboardButton("🖼️ صورة", callback_data=f"eqb_i_{index}"),
+            InlineKeyboardButton("🗑️ حذف", callback_data=f"eqb_d_{index}"),
+        ],
+        [InlineKeyboardButton("🔙 الأسئلة", callback_data="eqb_review")],
+    ])
+
+
+def _review_text(pe: dict) -> str:
+    qs = pe.get("questions") or []
+    lines = [
+        f"📝 {pe.get('title') or 'امتحان'}",
+        f"⏱ {pe.get('duration', 30)} دقيقة | ❓ {len(qs)} سؤال",
+        "",
+        "اضغط رقم السؤال للتعديل أو إضافة صورة.",
+        "",
+    ]
+    for i, q in enumerate(qs, 1):
+        letter = option_letter(q.get("correct_index", -1))
+        img = " 🖼️" if q.get("image") else ""
+        preview = (q.get("question") or "—").replace("\n", " ")
+        if len(preview) > 70:
+            preview = preview[:67] + "..."
+        lines.append(f"{i}. {preview}{img}")
+        lines.append(f"   الجواب: {letter}")
+    return "\n".join(lines)
+
+
+BULK_PROMPT = (
+    "📋 أرسل الأسئلة دفعة واحدة بهذا الشكل:\n\n"
+    "<pre>"
+    "السؤال\n"
+    "A) الخيار الأول\n"
+    "B) الخيار الثاني\n"
+    "C) الخيار الثالث\n"
+    "D) الخيار الرابع\n"
+    "E) الخيار الخامس\n"
+    "B"
+    "</pre>\n\n"
+    "السطر الأخير <b>حرف الجواب فقط</b> (A أو B أو C أو D أو E).\n"
+    "يمكنك لصق عشرات الأسئلة في رسالة واحدة، أو عدة رسائل ثم اكتب <b>تم</b>.\n"
+    "أو أرسل ملف TXT."
+)
 
 
 # ─── دخول / حل ───
@@ -115,6 +193,7 @@ async def start_exam_directly(context, db, exam_id, chat_id, user_id):
         parse_mode="Markdown",
     )
     await _send_poll_question(context, chat_id, context.user_data["active_exam"])
+    log_user_activity(db, user_id, "exam_start", f"{exam_id} — {exam['title']}")
     return True
 
 
@@ -177,6 +256,10 @@ async def _finish(context, db, chat_id, ed):
     total, wrong = len(qs), len(qs) - ok
     pct = ok / total * 100 if total else 0
     db.save_exam_result(ed["exam_id"], ed["taker_id"], ok, total, pct, ans)
+    log_user_activity(
+        db, ed["taker_id"], "exam_finish",
+        f"{ed['exam_id']} — {ok}/{total} ({pct:.0f}%)",
+    )
     await context.bot.send_message(
         chat_id,
         format_student_result(ed["title"], ok, wrong, total, pct,
@@ -191,8 +274,8 @@ def setup_exam_handlers(db, back_to_main):
     async def create_start(update, context):
         if not await check_channel_subscription(update, context, db):
             return ConversationHandler.END
-        context.user_data["poll_exam"] = {"title": "", "duration": 30, "questions": [], "q": {}}
-        await update.message.reply_text("📊 **سؤال الاستطلاع**\n\nأرسل **عنوان الامتحان**:", parse_mode="Markdown")
+        context.user_data["poll_exam"] = {"title": "", "duration": 30, "questions": [], "page": 0}
+        await update.message.reply_text("📊 إنشاء امتحان\n\nأرسل **عنوان الامتحان**:", parse_mode="Markdown")
         return states.EXAM_CREATE_TITLE
 
     async def create_title(update, context):
@@ -218,126 +301,212 @@ def setup_exam_handlers(db, back_to_main):
             await update.message.reply_text("❌ أرسل رقماً بين 1 و 180.")
             return states.EXAM_CREATE_DURATION
         await update.message.reply_text(
-            f"✅ الزمن: **{d} دقيقة** لكل الامتحان\n\n"
-            f"**السؤال 1:** أرسل نص السؤال أو صورة 🖼️:",
-            parse_mode="Markdown",
+            f"✅ الزمن: <b>{d} دقيقة</b>\n\n{BULK_PROMPT}",
+            parse_mode="HTML",
         )
-        return states.EXAM_Q_TEXT
+        return states.EXAM_BULK_INPUT
 
     async def set_duration_btn(update, context):
         await update.callback_query.answer()
         d = int(update.callback_query.data.replace("pdur_", ""))
         context.user_data["poll_exam"]["duration"] = d
         await update.callback_query.edit_message_text(
-            f"✅ الزمن: **{d} دقيقة** لكل الامتحان\n\n"
-            f"**السؤال 1:** أرسل نص السؤال أو صورة 🖼️:",
-            parse_mode="Markdown",
+            f"✅ الزمن: <b>{d} دقيقة</b>\n\n{BULK_PROMPT}",
+            parse_mode="HTML",
         )
-        return states.EXAM_Q_TEXT
+        return states.EXAM_BULK_INPUT
 
-    async def create_q_text(update, context):
-        pe = context.user_data["poll_exam"]
-        q = pe.setdefault("q", {})
-
-        if update.message.photo:
-            q["image"] = update.message.photo[-1].file_id
-            if update.message.caption:
-                q["question"] = update.message.caption.strip()
+    async def _send_review(target, context, *, edit=False):
+        pe = context.user_data.get("poll_exam") or {}
+        qs = pe.get("questions") or []
+        page = int(pe.get("page") or 0)
+        if qs:
+            text = _review_text(pe)
+            kb = _review_keyboard(len(qs), page)
+            parse_mode = None
         else:
-            q["question"] = update.message.text.strip()
+            text = "لا توجد أسئلة بعد.\n\n" + BULK_PROMPT
+            kb = None
+            parse_mode = "HTML"
+        chunks = split_text_chunks(text, 3500)
 
-        if not q.get("question") and not q.get("image"):
-            await update.message.reply_text("❌ أرسل نصاً أو صورة.")
-            return states.EXAM_Q_TEXT
+        def _chat_id():
+            if hasattr(target, "effective_chat") and target.effective_chat:
+                return target.effective_chat.id
+            if hasattr(target, "message") and target.message:
+                return target.message.chat_id
+            if hasattr(target, "chat"):
+                return target.chat.id
+            return None
 
-        if q.get("image"):
-            await update.message.reply_text(
-                "**الخيارات:**\n\nأرسل كل خيار في سطر (2 إلى 10):",
-                parse_mode="Markdown",
+        if edit:
+            try:
+                await target.edit_message_text(
+                    chunks[0], reply_markup=kb, parse_mode=parse_mode,
+                )
+                return
+            except Exception:
+                pass
+        chat_id = _chat_id()
+        await context.bot.send_message(
+            chat_id, chunks[0], reply_markup=kb if len(chunks) == 1 else None,
+            parse_mode=parse_mode,
+        )
+        for i, chunk in enumerate(chunks[1:], 1):
+            last = i == len(chunks) - 1
+            await context.bot.send_message(
+                chat_id, chunk, reply_markup=kb if last else None,
             )
-            return states.EXAM_Q_OPTIONS
 
-        await update.message.reply_text(
-            "🖼️ أرسل **صورة** للسؤال (اختياري) أو اضغط «التالي»:",
-            parse_mode="Markdown",
-            reply_markup=_skip_img_kb(),
-        )
-        return states.EXAM_Q_IMAGE
+    async def _extract_bulk_text(update, user_id) -> str:
+        if update.message.document:
+            doc = update.message.document
+            name = (doc.file_name or "").lower()
+            mime = (doc.mime_type or "").lower()
+            if not (name.endswith(".txt") or mime.startswith("text/")):
+                return ""
+            path = get_user_temp_dir(user_id) / (doc.file_name or "questions.txt")
+            tg_file = await doc.get_file()
+            await tg_file.download_to_drive(str(path))
+            return path.read_text(encoding="utf-8", errors="ignore")
+        return update.message.text or ""
 
-    async def add_q_image(update, context):
-        q = context.user_data["poll_exam"]["q"]
-        q["image"] = update.message.photo[-1].file_id
-        if update.message.caption and not q.get("question"):
-            q["question"] = update.message.caption.strip()
-        await update.message.reply_text(
-            "✅ تمت إضافة الصورة.\n\n**الخيارات:**\nأرسل كل خيار في سطر:",
-            parse_mode="Markdown",
+    async def receive_bulk(update, context):
+        pe = context.user_data.setdefault(
+            "poll_exam", {"title": "", "duration": 30, "questions": [], "page": 0},
         )
-        return states.EXAM_Q_OPTIONS
+        raw = (update.message.text or "").strip()
+        if raw in ("تم", "تم.", "✅ تم"):
+            if not pe.get("questions"):
+                await update.message.reply_text("❌ لم تُرسل أسئلة بعد.")
+                return states.EXAM_BULK_INPUT
+            await _send_review(update, context)
+            return states.EXAM_AFTER_SAVE
 
-    async def skip_image(update, context):
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            "**الخيارات:**\n\nأرسل كل خيار في سطر (2 إلى 10):",
-            parse_mode="Markdown",
-        )
-        return states.EXAM_Q_OPTIONS
+        text = await _extract_bulk_text(update, update.effective_user.id)
+        if not text.strip():
+            await update.message.reply_text(
+                "❌ أرسل النص أو ملف TXT بالصيغة المطلوبة.\n\n" + BULK_PROMPT,
+                parse_mode="HTML",
+            )
+            return states.EXAM_BULK_INPUT
 
-    async def create_q_options(update, context):
-        opts = [x.strip() for x in update.message.text.strip().split("\n") if x.strip()]
-        if len(opts) < 2:
-            await update.message.reply_text("❌ خياران على الأقل.")
-            return states.EXAM_Q_OPTIONS
-        context.user_data["poll_exam"]["q"]["options"] = opts[:10]
-        await update.message.reply_text(
-            "**الإجابة الصحيحة:**\n\nاضغط الخيار الصحيح:",
-            reply_markup=_poll_correct_kb(opts[:10]),
-        )
-        return states.EXAM_Q_OPTIONS
-
-    async def pick_correct(update, context):
-        await update.callback_query.answer()
-        i = int(update.callback_query.data.replace("pc_", ""))
-        pe = context.user_data["poll_exam"]
-        q = pe["q"]
-        q["correct_index"] = i
-        pe["questions"].append(q)
-        pe["q"] = {}
-
-        chat = update.effective_chat.id
-        if q.get("image"):
-            await context.bot.send_photo(chat, q["image"])
-        await context.bot.send_poll(
-            chat, q.get("question") or "اختر الإجابة:",
-            [_trim(o, 100) for o in q["options"]],
-            type=Poll.QUIZ, correct_option_id=i, is_anonymous=False,
-        )
-        await update.callback_query.edit_message_text("✅ تم")
-        await update.callback_query.message.reply_text(
-            f"تم حفظ السؤال {len(pe['questions'])}",
-            reply_markup=_after_question_kb(),
-        )
+        qs, errs = parse_mcq_batch(text)
+        if qs:
+            pe.setdefault("questions", []).extend(qs)
+        parts = []
+        if qs:
+            parts.append(f"✅ أُضيف {len(qs)} سؤال — الإجمالي {len(pe['questions'])}")
+        if errs:
+            parts.append("⚠️ " + "\n".join(errs[:10]))
+        if not qs:
+            parts.append("لم يُستخرج أي سؤال. استخدم الصيغة:\n" + EXAMPLE_MCQ)
+            await update.message.reply_text("\n\n".join(parts))
+            return states.EXAM_BULK_INPUT
+        await update.message.reply_text("\n\n".join(parts))
+        await _send_review(update, context)
         return states.EXAM_AFTER_SAVE
 
-    async def more_question(update, context):
-        await update.callback_query.answer()
-        n = len(context.user_data["poll_exam"]["questions"]) + 1
-        await update.callback_query.message.reply_text(
-            f"**السؤال {n}:**\n\nأرسل نص السؤال أو صورة 🖼️:",
-            parse_mode="Markdown",
-        )
-        return states.EXAM_Q_TEXT
+    async def review_cb(update, context):
+        query = update.callback_query
+        await query.answer()
+        pe = context.user_data.get("poll_exam") or {}
+        qs = pe.get("questions") or []
+        data = query.data
+
+        if data == "eqb_more":
+            await query.message.reply_text(BULK_PROMPT, parse_mode="HTML")
+            return states.EXAM_BULK_INPUT
+        if data == "eqb_review":
+            pe["page"] = 0
+            await _send_review(query, context, edit=True)
+            return states.EXAM_AFTER_SAVE
+        if data.startswith("eqb_p_"):
+            pe["page"] = int(data.replace("eqb_p_", "") or 0)
+            await _send_review(query, context, edit=True)
+            return states.EXAM_AFTER_SAVE
+        if data.startswith("eqb_v_"):
+            i = int(data.replace("eqb_v_", ""))
+            if not 0 <= i < len(qs):
+                return states.EXAM_AFTER_SAVE
+            q = qs[i]
+            if q.get("image"):
+                await query.message.reply_photo(q["image"], caption=f"🖼️ سؤال {i + 1}")
+            await query.message.reply_text(
+                format_question_block(q, i + 1),
+                reply_markup=_question_edit_kb(i),
+            )
+            return states.EXAM_AFTER_SAVE
+        if data.startswith("eqb_e_"):
+            i = int(data.replace("eqb_e_", ""))
+            pe["edit_index"] = i
+            await query.message.reply_text(
+                f"✏️ تعديل السؤال {i + 1}\n\nأرسل السؤال من جديد بالصيغة:\n\n"
+                f"<pre>السؤال\nA) ...\nB) ...\nC) ...\nD) ...\nE) ...\nB</pre>",
+                parse_mode="HTML",
+            )
+            return states.EXAM_EDIT_ONE
+        if data.startswith("eqb_i_"):
+            i = int(data.replace("eqb_i_", ""))
+            pe["image_index"] = i
+            await query.message.reply_text(f"🖼️ أرسل صورة السؤال {i + 1}:")
+            return states.EXAM_Q_IMAGE
+        if data.startswith("eqb_d_"):
+            i = int(data.replace("eqb_d_", ""))
+            if 0 <= i < len(qs):
+                qs.pop(i)
+            await query.message.reply_text(f"🗑️ حُذف السؤال {i + 1}")
+            await _send_review(query.message, context)
+            return states.EXAM_AFTER_SAVE
+        return states.EXAM_AFTER_SAVE
+
+    async def edit_one_question(update, context):
+        pe = context.user_data.get("poll_exam") or {}
+        i = pe.get("edit_index")
+        qs, errs = parse_mcq_batch(update.message.text or "")
+        if len(qs) != 1:
+            msg = "❌ أرسل سؤالاً واحداً بالصيغة المطلوبة."
+            if errs:
+                msg += "\n" + "\n".join(errs[:5])
+            await update.message.reply_text(msg)
+            return states.EXAM_EDIT_ONE
+        if i is None or not 0 <= i < len(pe.get("questions") or []):
+            pe.setdefault("questions", []).append(qs[0])
+        else:
+            old_img = pe["questions"][i].get("image")
+            pe["questions"][i] = qs[0]
+            if old_img:
+                pe["questions"][i]["image"] = old_img
+        pe.pop("edit_index", None)
+        await update.message.reply_text("✅ تم تعديل السؤال.")
+        await _send_review(update, context)
+        return states.EXAM_AFTER_SAVE
+
+    async def add_q_image(update, context):
+        pe = context.user_data.get("poll_exam") or {}
+        i = pe.get("image_index")
+        qs = pe.get("questions") or []
+        if i is None or not 0 <= i < len(qs):
+            await update.message.reply_text("❌ اختر السؤال أولاً من القائمة.")
+            return states.EXAM_AFTER_SAVE
+        qs[i]["image"] = update.message.photo[-1].file_id
+        pe.pop("image_index", None)
+        await update.message.reply_text(f"✅ أُضيفت الصورة للسؤال {i + 1}")
+        await _send_review(update, context)
+        return states.EXAM_AFTER_SAVE
 
     async def publish(update, context):
-        await update.callback_query.answer()
+        query = update.callback_query
         pe = context.user_data.get("poll_exam", {})
         if not pe.get("questions"):
-            await update.callback_query.answer("❌ أضف سؤالاً!", show_alert=True)
-            return ConversationHandler.END
+            await query.answer("❌ أضف سؤالاً!", show_alert=True)
+            return states.EXAM_AFTER_SAVE
+        await query.answer()
         eid = generate_exam_id()
         uid = update.effective_user.id
         dur = pe.get("duration", 30)
         db.create_exam(eid, pe["title"], pe["questions"], dur, uid, is_published=True)
+        log_user_activity(db, uid, "exam_create", f"{eid} — {pe['title']}")
         bot = (await context.bot.get_me()).username
         link = build_exam_link(bot, eid)
         await update.callback_query.message.reply_text(
@@ -373,6 +542,10 @@ def setup_exam_handlers(db, back_to_main):
             parse_mode="Markdown",
         )
         await _send_poll_question(context, update.effective_chat.id, context.user_data["active_exam"])
+        log_user_activity(
+            db, update.effective_user.id, "exam_start",
+            f"{eid} — {ex['title']}",
+        )
 
     async def on_poll_answer(update, context):
         pa = update.poll_answer
@@ -486,20 +659,24 @@ def setup_exam_handlers(db, back_to_main):
                 MessageHandler(filters.TEXT & ~filters.COMMAND, set_duration_text),
                 CallbackQueryHandler(set_duration_btn, pattern=r"^pdur_\d+$"),
             ],
-            states.EXAM_Q_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_q_text),
-                MessageHandler(filters.PHOTO, create_q_text),
+            states.EXAM_BULK_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_bulk),
+                MessageHandler(filters.Document.ALL, receive_bulk),
+                CallbackQueryHandler(review_cb, pattern=r"^eqb_"),
+                CallbackQueryHandler(publish, pattern="^pq_done$"),
+            ],
+            states.EXAM_EDIT_ONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_one_question),
+                CallbackQueryHandler(review_cb, pattern=r"^eqb_"),
             ],
             states.EXAM_Q_IMAGE: [
                 MessageHandler(filters.PHOTO, add_q_image),
-                CallbackQueryHandler(skip_image, pattern="^pq_skip_img$"),
-            ],
-            states.EXAM_Q_OPTIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_q_options),
-                CallbackQueryHandler(pick_correct, pattern=r"^pc_\d+$"),
+                CallbackQueryHandler(review_cb, pattern=r"^eqb_"),
             ],
             states.EXAM_AFTER_SAVE: [
-                CallbackQueryHandler(more_question, pattern="^pq_more$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_bulk),
+                MessageHandler(filters.Document.ALL, receive_bulk),
+                CallbackQueryHandler(review_cb, pattern=r"^eqb_"),
                 CallbackQueryHandler(publish, pattern="^pq_done$"),
             ],
         },

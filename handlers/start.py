@@ -17,10 +17,14 @@ from services.channel_check import check_channel_subscription, handle_check_subs
 from handlers.exams import show_exam_entry
 from utils.helpers import is_admin, parse_exam_id_from_start
 from utils.keyboards import MAIN_MENU, ADMIN_MENU, admin_dashboard_inline
+from utils.activity_log import log_user_activity
 
 logger = logging.getLogger(__name__)
 
 MAIN_MENU_PATTERN = filters.Regex("^🏠 القائمة الرئيسية$|^🔙 القائمة الرئيسية$")
+REMOVED_HANDWRITING = filters.Regex(
+    r"^✍️ خط اليد$|^✍️ تحويل نص$|^📁 تحويل ملف$|^🔵 حبر أزرق$|^⚫ حبر أسود$"
+)
 
 
 def setup_start_handlers(db: Database) -> list:
@@ -58,7 +62,7 @@ def setup_start_handlers(db: Database) -> list:
                 text=text,
                 reply_markup=MAIN_MENU,
             )
-            db.log_activity(user.id, "start")
+            log_user_activity(db, user.id, "start")
         except Exception:
             logger.exception("start_cmd failed for user %s", user.id)
             await context.bot.send_message(
@@ -73,9 +77,11 @@ def setup_start_handlers(db: Database) -> list:
         help_text = """ℹ️ **دليل استخدام البوت**
 
 📚 **الترجمة** — ترجمة نصوص وملفات وصور (عربي ↔ إنجليزي)
-📄 **أدوات PDF** — تحويل، دمج، تقسيم، ضغط
+📋 **واجهة تقرير** — غلاف تقرير أكاديمي PDF أو Word
+📄 **أدوات PDF** — تحويل، دمج، تقسيم، ضغط، سلايدات
 📝 **الامتحانات** — اختبارات إلكترونية مع تصحيح تلقائي
 🧑‍🎓 **حسابي** — نقاطك ونتائجك وترتيبك
+🛡️ **حماية الكروبات** — منع تحويل وروابط القنوات غير المسموحة
 
 🔧 الأوامر:
 /start — البداية
@@ -133,8 +139,17 @@ def setup_start_handlers(db: Database) -> list:
     async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await go_main_menu(update, context)
 
+    async def handwriting_removed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        await update.message.reply_text(
+            "تم إلغاء قسم خط اليد.\nاختر قسماً من القائمة أدناه.",
+            reply_markup=MAIN_MENU,
+        )
+        raise ApplicationHandlerStop()
+
     return [
         MessageHandler(MAIN_MENU_PATTERN, main_menu_priority),
+        MessageHandler(REMOVED_HANDWRITING, handwriting_removed),
         CommandHandler("start", start_cmd),
         CommandHandler("help", help_cmd),
         CommandHandler("admin", admin_cmd),

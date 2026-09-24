@@ -1,10 +1,58 @@
 """تنسيق العربية والإنجليزية — خطوط، اتجاه، وربط الحروف"""
 import re
+import threading
 from pathlib import Path
 
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt
+
+_tls = threading.local()
+FONT_SCALES = (0.86, 1.0, 1.16)
+FONT_LABELS = ("صغير", "متوسط", "كبير")
+DEFAULT_FONT_INDEX = 1
+
+TRANSLATION_COLORS = {
+    "black": (0.0, 0.0, 0.0),
+    "red": (0.82, 0.06, 0.08),
+    "blue": (0.06, 0.28, 0.80),
+    "green": (0.05, 0.52, 0.18),
+}
+TRANSLATION_COLOR_LABELS = {
+    "black": "أسود",
+    "red": "أحمر",
+    "blue": "أزرق",
+    "green": "أخضر",
+}
+
+
+def set_font_scale(scale: float) -> None:
+    try:
+        _tls.scale = float(scale)
+    except (TypeError, ValueError):
+        _tls.scale = 1.0
+
+
+def font_scale() -> float:
+    val = getattr(_tls, "scale", 1.0)
+    try:
+        return max(0.7, min(1.4, float(val)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def scaled_pt(base: float, min_size: float = 5.0) -> float:
+    return max(min_size, float(base) * font_scale())
+
+
+def set_translation_color(name: str) -> None:
+    _tls.color_name = name if name in TRANSLATION_COLORS else "black"
+
+
+def translation_color_rgb() -> tuple[float, float, float]:
+    name = getattr(_tls, "color_name", "black")
+    return TRANSLATION_COLORS.get(name, (0.0, 0.0, 0.0))
+
 
 ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
 EN_RE = re.compile(r"[A-Za-z]")

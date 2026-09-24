@@ -1,7 +1,10 @@
+import asyncio
+import html
 import logging
 from pathlib import Path
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
@@ -12,7 +15,10 @@ from telegram.ext import (
 
 from config import ADMIN_USERNAME
 from database.db import Database
-from utils.helpers import generate_exam_id, get_user_temp_dir, is_admin, build_exam_link, sanitize_text_for_send
+from utils.helpers import (
+    generate_exam_id, get_user_temp_dir, is_admin, build_exam_link,
+    sanitize_text_for_send,
+)
 from utils.keyboards import (
     ADMIN_MENU,
     MAIN_MENU,
@@ -23,18 +29,134 @@ from utils.keyboards import (
     admin_channels_menu_keyboard,
     admin_channels_list_keyboard,
     admin_channel_actions_keyboard,
+    admin_users_menu_keyboard,
+    admin_users_page_keyboard,
+    admin_user_chat_keyboard,
+    admin_user_search_keyboard,
 )
 from utils import states
+from utils.activity_log import ACTIVITY_LABELS, format_activity_line, log_user_activity
 
 logger = logging.getLogger(__name__)
 
-ACTION_LABELS = {
-    "start": "بدء البوت",
-    "translate_text": "ترجمة نص",
-    "translate_file": "ترجمة ملف",
-    "pdf_extract": "استخراج نص",
-    "exam": "امتحان",
-}
+ACTION_LABELS = ACTIVITY_LABELS
+
+
+def _chunk_lines(lines: list[str], max_len: int = 3900) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current and current_len + line_len > max_len:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _esc(value) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _account_username(u: dict) -> str:
+    return (u.get("username") or "").strip().lstrip("@")
+
+
+def _profile_href(u: dict) -> str:
+    uname = _account_username(u)
+    if uname:
+        return f"https://t.me/{uname}"
+    uid = u.get("user_id")
+    if uid:
+        return f"tg://user?id={uid}"
+    return ""
+
+
+def _profile_link(text: str, u: dict) -> str:
+    href = _profile_href(u)
+    if not href:
+        return _esc(text)
+    return f'<a href="{_esc(href)}">{_esc(text)}</a>'
+
+
+def _username_html(u: dict) -> str:
+    uname = _account_username(u)
+    if not uname:
+        return "يوزر الحساب: —"
+    return f"يوزر الحساب: {_profile_link('@' + uname, u)}"
+
+
+def _name_html(u: dict) -> str:
+    name = (u.get("full_name") or "").strip() or "—"
+    return _profile_link(name, u)
+
+
+async def _refresh_user_from_telegram(bot, db, u: dict) -> dict:
+    uid = u.get("user_id")
+    if not uid:
+        return u
+    try:
+        chat = await bot.get_chat(int(uid))
+    except Exception:
+        return u
+    uname = (getattr(chat, "username", None) or "").strip().lstrip("@")
+    name = (
+        getattr(chat, "full_name", None)
+        or getattr(chat, "first_name", None)
+        or ""
+    ).strip()
+    if uname:
+        u["username"] = uname
+    if name:
+        u["full_name"] = name
+    if uname or name:
+        try:
+            db.upsert_user(int(uid), uname, name)
+        except Exception:
+            logger.warning("Failed to save refreshed username for %s", uid)
+    return u
+
+
+async def _enrich_users_from_telegram(bot, db, users: list[dict]) -> list[dict]:
+    if not users:
+        return users
+    sem = asyncio.Semaphore(8)
+
+    async def one(u: dict) -> dict:
+        async with sem:
+            return await _refresh_user_from_telegram(bot, db, u)
+
+    return list(await asyncio.gather(*(one(u) for u in users)))
+
+
+def _format_user_admin_line(seq: int, u: dict) -> str:
+    uid = u.get("user_id", "?")
+    return (
+        f"{seq}. {_name_html(u)}\n"
+        f"   {_username_html(u)}\n"
+        f"   المعرف: <code>{_esc(uid)}</code>"
+    )
+
+
+def _join_rank_map(users: list[dict]) -> dict[int, int]:
+    return {u["user_id"]: i for i, u in enumerate(users, 1)}
+
+
+def _format_user_search_block(u: dict, rank: int | str) -> str:
+    uid = u.get("user_id", "?")
+    return "\n".join(
+        [
+            f"#{rank} — {_name_html(u)}",
+            _username_html(u),
+            f"المعرف: <code>{_esc(uid)}</code>",
+        ]
+    )
 
 
 def _admin_only(update: Update) -> bool:
@@ -95,48 +217,275 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
         )
         await update.message.reply_text(text, reply_markup=ADMIN_MENU)
 
-    async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _USERS_PAGE = 8
+    _CHAT_PAGE = 6
+
+    def _users_page_text(total: int, page: int, pages: int) -> str:
+        if total == 0:
+            return "👥 لا يوجد مستخدمون بعد."
+        return (
+            f"👥 المستخدمون ({total})\n"
+            f"الصفحة {page + 1} من {pages}\n\n"
+            "اضغط على الشخص لعرض نشاطه مع البوت.\n"
+            "◀️ السابق / التالي ▶️ للتنقل بين الصفحات."
+        )
+
+    async def _edit_or_send(query, text: str, **kwargs):
+        try:
+            await query.edit_message_text(text, **kwargs)
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+            await query.message.reply_text(text, **kwargs)
+
+    async def _show_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+        users = db.get_all_users()
+        total = len(users)
+        pages = max(1, (total + _USERS_PAGE - 1) // _USERS_PAGE) if total else 1
+        page = max(0, min(page, pages - 1))
+        text = _users_page_text(total, page, pages)
+        kb = admin_users_page_keyboard(users, page, _USERS_PAGE)
+        query = update.callback_query
+        if query and query.message:
+            await _edit_or_send(query, text, reply_markup=kb)
+            return
+        await update.message.reply_text(text, reply_markup=kb)
+
+    async def _show_user_chat(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        msg_page: int | None,
+        list_page: int,
+    ):
+        users = db.get_all_users()
+        ids = [u["user_id"] for u in users]
+        try:
+            index = ids.index(user_id)
+        except ValueError:
+            index = -1
+        stored = next((u for u in users if u["user_id"] == user_id), None)
+        if stored is None:
+            stored = db.get_user(user_id) or {
+                "user_id": user_id, "username": "", "full_name": "",
+            }
+        stored = await _refresh_user_from_telegram(context.bot, db, dict(stored))
+
+        total = db.count_user_activities(user_id)
+        pages = max(1, (total + _CHAT_PAGE - 1) // _CHAT_PAGE) if total else 1
+        if msg_page is None:
+            msg_page = 0
+        msg_page = max(0, min(msg_page, pages - 1))
+        rows = db.get_user_activities(user_id, _CHAT_PAGE, msg_page * _CHAT_PAGE) if total else []
+
+        prev_user = None
+        next_user = None
+        if index > 0:
+            prev_id = ids[index - 1]
+            prev_user = (prev_id, (index - 1) // _USERS_PAGE)
+        if 0 <= index < len(ids) - 1:
+            next_id = ids[index + 1]
+            next_user = (next_id, (index + 1) // _USERS_PAGE)
+
+        header = [
+            f"👤 {_name_html(stored)}",
+            _username_html(stored),
+            f"🆔 <code>{_esc(user_id)}</code>",
+            "",
+        ]
+        if total:
+            start = msg_page * _CHAT_PAGE + 1
+            end = start + len(rows) - 1
+            header.append(f"📜 نشاطه مع البوت: {start}–{end} من {total}")
+            header.append("")
+            for act in rows:
+                action = ACTIVITY_LABELS.get(act.get("action", ""), act.get("action", ""))
+                detail = f" — {_esc(act['details'])}" if act.get("details") else ""
+                ts = str(act.get("created_at") or "")[:16].replace("T", " ")
+                when = f"[{_esc(ts)}] " if ts else ""
+                header.append(f"• {when}{_esc(action)}{detail}")
+        else:
+            header.append("ما مسجّل نشاط لهذا الشخص بعد.")
+
+        text = "\n".join(header)
+        if len(text) > 3900:
+            text = text[:3900] + "…"
+        kb = admin_user_chat_keyboard(
+            user_id, msg_page, pages, max(0, list_page), prev_user, next_user,
+        )
+        query = update.callback_query
+        kwargs = {
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": kb,
+        }
+        if query and query.message:
+            await _edit_or_send(query, text, **kwargs)
+            return
+        await update.message.reply_text(text, **kwargs)
+
+    async def _browse_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        data = update.callback_query.data or ""
+        try:
+            if data.startswith("adm_up_"):
+                await _show_users_page(update, context, int(data.rsplit("_", 1)[-1]))
+                return True
+            if data.startswith("adm_um_"):
+                uid_s, list_page_s = data[len("adm_um_"):].rsplit("_", 1)
+                await _show_user_chat(
+                    update, context, int(uid_s), None, int(list_page_s),
+                )
+                return True
+            if data.startswith("adm_uc_"):
+                uid_s, msg_page_s, list_page_s = data[len("adm_uc_"):].rsplit("_", 2)
+                await _show_user_chat(
+                    update, context, int(uid_s), int(msg_page_s), int(list_page_s),
+                )
+                return True
+        except (ValueError, BadRequest):
+            logger.exception("Failed to open admin user chat view")
+            await update.callback_query.message.reply_text("❌ تعذر فتح هذه المحادثة.")
+            return True
+        return False
+
+    async def show_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _admin_only(update):
             return await _deny(update)
-        users = db.get_all_users()
-        if not users:
-            await update.message.reply_text("لا يوجد مستخدمون.", reply_markup=ADMIN_MENU)
-            return
-        lines = ["👥 المستخدمون\n"]
-        for u in users[:40]:
-            name = u.get("full_name") or u.get("username") or f"ID:{u['user_id']}"
-            lines.append(f"• {name} — {u['points']} نقطة")
-        if len(users) > 40:
-            lines.append(f"\n... و {len(users) - 40} آخرين")
-        await update.message.reply_text("\n".join(lines), reply_markup=ADMIN_MENU)
+        await _show_users_page(update, context, 0)
+        return ConversationHandler.END
+
+    async def users_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if not _admin_only(update):
+            return await _deny(update)
+        await query.edit_message_text(
+            "🔍 بحث عن مستخدم\n\n"
+            "أرسل:\n"
+            "• @يوزر أو يوزر\n"
+            "• جزء من الاسم\n"
+            "• رقم Telegram ID\n\n"
+            "سيظهر هل الشخص مسجّل في البوت أم لا.",
+        )
+        return states.ADMIN_USER_SEARCH
+
+    async def users_browse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if not _admin_only(update):
+            return await _deny(update)
+        await _browse_users(update, context)
+        return ConversationHandler.END
+
+    async def user_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _admin_only(update):
+            return await _deny(update)
+        if update.message.text in ("🏠 القائمة الرئيسية", "👥 المستخدمون"):
+            if update.message.text == "👥 المستخدمون":
+                await show_users_menu(update, context)
+            else:
+                await back_main_admin(update, context)
+            return ConversationHandler.END
+
+        query_text = (update.message.text or "").strip()
+        if not query_text:
+            await update.message.reply_text("❌ أرسل نصاً للبحث.")
+            return states.ADMIN_USER_SEARCH
+
+        matches = db.search_users(query_text)
+        ranks = _join_rank_map(db.get_all_users())
+
+        if matches:
+            matches = await _enrich_users_from_telegram(context.bot, db, matches)
+            blocks = [f"🔍 نتائج البحث: {_esc(query_text)}\n"]
+            for u in matches:
+                rank = ranks.get(u["user_id"], "?")
+                blocks.append(_format_user_search_block(u, rank))
+                blocks.append("")
+            await update.message.reply_text(
+                "\n".join(blocks).strip(),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=admin_user_search_keyboard(matches),
+            )
+            return ConversationHandler.END
+
+        q = query_text.lstrip("@")
+        tg_user = None
+        try:
+            tg_user = await context.bot.get_chat(int(q) if q.isdigit() else f"@{q}")
+        except BadRequest:
+            pass
+        except Exception as e:
+            logger.warning("Telegram user lookup failed: %s", e)
+
+        if tg_user:
+            fake = {
+                "user_id": tg_user.id,
+                "username": getattr(tg_user, "username", None) or "",
+                "full_name": getattr(tg_user, "full_name", None)
+                or getattr(tg_user, "first_name", "")
+                or "—",
+            }
+            text = (
+                f"🔍 نتائج البحث: {_esc(query_text)}\n\n"
+                "❌ ليس مستخدماً للبوت\n\n"
+                "📱 الحساب موجود على تيليجرام:\n"
+                f"• {_name_html(fake)}\n"
+                f"• {_username_html(fake)}\n"
+                f"• 🆔 <code>{tg_user.id}</code>"
+            )
+        else:
+            text = (
+                f"🔍 نتائج البحث: {_esc(query_text)}\n\n"
+                "❌ غير مسجّل في البوت\n"
+                "❌ لم يُعثر على الحساب في تيليجرام"
+            )
+
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=admin_users_menu_keyboard(),
+        )
+        return ConversationHandler.END
 
     async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _admin_only(update):
             return await _deny(update)
-        board = db.get_leaderboard(15)
+        board = await _enrich_users_from_telegram(context.bot, db, db.get_leaderboard(15))
         if not board:
             await update.message.reply_text("لا يوجد ترتيب بعد.", reply_markup=ADMIN_MENU)
             return
         lines = ["🏆 ترتيب الطلاب\n"]
         for i, u in enumerate(board, 1):
-            name = u.get("full_name") or u.get("username") or f"ID:{u['user_id']}"
-            lines.append(f"{i}. {name} — {u['points']} نقطة ({u['exams_taken']} امتحان)")
-        await update.message.reply_text("\n".join(lines), reply_markup=ADMIN_MENU)
+            lines.append(
+                f"{i}. {_name_html(u)} — {_username_html(u)}\n"
+                f"   {u['points']} نقطة ({u.get('exams_taken', 0)} امتحان)"
+            )
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=ADMIN_MENU,
+        )
 
     async def show_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _admin_only(update):
             return await _deny(update)
-        rows = db.get_recent_activities(20)
+        rows = db.get_recent_activities(50)
         if not rows:
             await update.message.reply_text("لا يوجد نشاط مسجّل.", reply_markup=ADMIN_MENU)
             return
-        lines = ["📜 سجل النشاط الأخير\n"]
+        lines = [f"📜 سجل النشاط ({len(rows)})\n"]
         for r in rows:
-            name = r.get("full_name") or r.get("username") or str(r.get("user_id", ""))
-            action = ACTION_LABELS.get(r["action"], r["action"])
-            detail = f" — {r['details']}" if r.get("details") else ""
-            lines.append(f"• {name}: {action}{detail}")
-        await update.message.reply_text("\n".join(lines)[:4000], reply_markup=ADMIN_MENU)
+            lines.append(format_activity_line(r))
+        chunks = _chunk_lines(lines)
+        for i, chunk in enumerate(chunks):
+            await update.message.reply_text(
+                chunk,
+                reply_markup=ADMIN_MENU if i == len(chunks) - 1 else None,
+            )
 
     async def show_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _admin_only(update):
@@ -147,7 +496,7 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
         text = (
             "🛠️ حالة الخدمات — الكل مفعّل ✅\n\n"
             "📚 الترجمة — نص + ملف (4 أنماط)\n"
-            "📄 PDF — تحويل، دمج، تقسيم، ضغط، استخراج OCR\n"
+            "📄 PDF — تحويل، دمج، تقسيم، ضغط، استخراج OCR، دمج سلايدات\n"
             "📝 امتحانات — إنشاء، حل، نتائج، تصدير\n"
             "🧑‍🎓 حساب طلابي — نقاط وترتيب\n\n"
             "اضغط 🏠 القائمة الرئيسية لاستخدام أي خدمة."
@@ -170,6 +519,9 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
         data = query.data
         if data == "adm_noop":
             return
+        if data.startswith(("adm_up_", "adm_um_", "adm_uc_")):
+            await _browse_users(update, context)
+            return
         if data == "adm_stats":
             stats = db.get_stats()
             await query.message.reply_text(
@@ -178,14 +530,13 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
             )
             return
         if data == "adm_activity":
-            rows = db.get_recent_activities(10)
+            rows = db.get_recent_activities(15)
             if not rows:
                 await query.message.reply_text("لا نشاط.", reply_markup=ADMIN_MENU)
                 return
-            lines = ["📜 آخر النشاطات:"]
-            for r in rows[:10]:
-                action = ACTION_LABELS.get(r["action"], r["action"])
-                lines.append(f"• {action}: {r.get('details', '')}")
+            lines = ["📜 آخر النشاطات:\n"]
+            for r in rows:
+                lines.append(format_activity_line(r))
             await query.message.reply_text("\n".join(lines)[:3500], reply_markup=ADMIN_MENU)
             return
         if data == "adm_services":
@@ -206,16 +557,24 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
         if data.startswith("adm_exam_res_"):
             exam_id = data.replace("adm_exam_res_", "")
             stats = db.get_exam_stats(exam_id)
-            results = db.get_exam_results(exam_id)
+            results = await _enrich_users_from_telegram(
+                context.bot, db, db.get_exam_results(exam_id)[:10]
+            )
             lines = [
                 f"📊 نتائج {exam_id}",
                 f"المشاركون: {stats['participants']}",
                 f"المتوسط: {stats['avg_score']:.1f}%",
             ]
-            for i, r in enumerate(results[:10], 1):
-                name = r.get("full_name") or r.get("username") or r["user_id"]
-                lines.append(f"{i}. {name} — {r['percentage']:.0f}%")
-            await query.message.reply_text("\n".join(lines), reply_markup=ADMIN_MENU)
+            for i, r in enumerate(results, 1):
+                lines.append(
+                    f"{i}. {_name_html(r)} — {_username_html(r)} — {r['percentage']:.0f}%"
+                )
+            await query.message.reply_text(
+                "\n".join(lines),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=ADMIN_MENU,
+            )
             return
         if data.startswith("adm_exam_"):
             exam_id = data.replace("adm_exam_", "")
@@ -383,6 +742,10 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
         title = exam_data.get("title", "امتحان")
         duration = exam_data.get("duration", 30)
         db.create_exam(exam_id, title, questions, duration, update.effective_user.id)
+        log_user_activity(
+            db, update.effective_user.id, "exam_create",
+            f"{exam_id} — {title}",
+        )
         bot_username = (await context.bot.get_me()).username
         link = build_exam_link(bot_username, exam_id)
         text = (
@@ -728,15 +1091,34 @@ def setup_admin_handlers(db: Database, back_to_main) -> list:
         fallbacks=[MessageHandler(filters.Regex("^🏠 القائمة الرئيسية$"), back_main_admin)],
     )
 
+    users_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(users_menu_callback, pattern="^adm_users_search$"),
+        ],
+        states={
+            states.ADMIN_USER_SEARCH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, user_search_input),
+                CallbackQueryHandler(users_menu_callback, pattern="^adm_users_search$"),
+                CallbackQueryHandler(users_browse_callback, pattern=r"^adm_u[pmc]_"),
+            ],
+        },
+        fallbacks=[
+            MessageHandler(filters.Regex("^🏠 القائمة الرئيسية$"), back_main_admin),
+            MessageHandler(filters.Regex("^👥 المستخدمون$"), show_users_menu),
+            CallbackQueryHandler(users_browse_callback, pattern=r"^adm_u[pmc]_"),
+        ],
+    )
+
     return [
         exam_conv,
         notify_conv,
         channel_conv,
         question_conv,
+        users_conv,
         CallbackQueryHandler(admin_callback, pattern="^adm_"),
         MessageHandler(filters.Regex("^📊 لوحة التحكم$"), show_dashboard),
         MessageHandler(filters.Regex("^📈 الإحصائيات$"), show_stats),
-        MessageHandler(filters.Regex("^👥 المستخدمون$"), show_users),
+        MessageHandler(filters.Regex("^👥 المستخدمون$"), show_users_menu),
         MessageHandler(filters.Regex("^🏆 ترتيب الطلاب$"), show_leaderboard),
         MessageHandler(filters.Regex("^📋 إدارة الامتحانات$"), list_exams),
         MessageHandler(filters.Regex("^❓ الأسئلة الجاهزة$"), list_questions),

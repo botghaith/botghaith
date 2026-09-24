@@ -8,6 +8,8 @@ from config import DATABASE_PATH, CHANNEL_USERNAME, CHANNEL_LINK, CHANNEL_REQUIR
 
 
 class Database:
+    backend = "SQLite"
+
     def __init__(self, db_path: Path = DATABASE_PATH):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,13 +268,23 @@ class Database:
     # ── Users ──
 
     def upsert_user(self, user_id: int, username: str = "", full_name: str = ""):
+        username = (username or "").strip().lstrip("@")
+        full_name = (full_name or "").strip()
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO users (user_id, username, full_name)
                    VALUES (?, ?, ?)
                    ON CONFLICT(user_id) DO UPDATE SET
-                   username = excluded.username,
-                   full_name = excluded.full_name""",
+                   username = CASE
+                       WHEN excluded.username IS NULL OR excluded.username = ''
+                       THEN users.username
+                       ELSE excluded.username
+                   END,
+                   full_name = CASE
+                       WHEN excluded.full_name IS NULL OR excluded.full_name = ''
+                       THEN users.full_name
+                       ELSE excluded.full_name
+                   END""",
                 (user_id, username, full_name),
             )
 
@@ -301,7 +313,25 @@ class Database:
 
     def get_all_users(self) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+            rows = conn.execute("SELECT * FROM users ORDER BY created_at ASC, user_id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def search_users(self, query: str) -> list[dict]:
+        q = (query or "").strip().lstrip("@")
+        if not q:
+            return []
+        if q.isdigit():
+            user = self.get_user(int(q))
+            return [user] if user else []
+        pattern = f"%{q}%"
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM users
+                   WHERE LOWER(COALESCE(username, '')) LIKE LOWER(?)
+                      OR LOWER(COALESCE(full_name, '')) LIKE LOWER(?)
+                   ORDER BY created_at ASC, user_id ASC""",
+                (pattern, pattern),
+            ).fetchall()
             return [dict(r) for r in rows]
 
     def get_user_count(self) -> int:
@@ -508,9 +538,137 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def count_user_activities(self, user_id: int) -> int:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM activity_log WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+
+    def get_user_activities(self, user_id: int, limit: int = 8, offset: int = 0) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT action, details, created_at FROM activity_log
+                   WHERE user_id = ?
+                   ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (user_id, limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_admin_questions_count(self) -> int:
         with self._connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM admin_questions").fetchone()[0]
+
+    # ── Group protection (داخل settings الموجودة، بدون جداول جديدة) ──
+
+    def _guard_load(self, key: str, default):
+        raw = self.get_setting(key, "")
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return default
+
+    def _guard_save(self, key: str, value) -> None:
+        self.set_setting(key, json.dumps(value, ensure_ascii=False))
+
+    def save_protected_group(self, chat_id: int, title: str, owner_id: int, is_active: bool = True):
+        groups = self._guard_load("guard_groups", {})
+        current = groups.get(str(chat_id), {})
+        groups[str(chat_id)] = {
+            "chat_id": chat_id,
+            "title": title or current.get("title") or "",
+            "owner_id": owner_id or current.get("owner_id") or 0,
+            "is_active": 1 if is_active else 0,
+        }
+        self._guard_save("guard_groups", groups)
+
+    def get_protected_group(self, chat_id: int) -> Optional[dict]:
+        return self._guard_load("guard_groups", {}).get(str(chat_id))
+
+    def list_groups_by_owner(self, owner_id: int) -> list[dict]:
+        groups = [
+            g for g in self._guard_load("guard_groups", {}).values()
+            if g.get("owner_id") == owner_id and g.get("is_active", 1)
+        ]
+        return sorted(groups, key=lambda g: g.get("title") or "")
+
+    def _next_guard_id(self, rows: list[dict]) -> int:
+        return max((int(row.get("id") or 0) for row in rows), default=0) + 1
+
+    def add_group_channel(self, chat_id: int, username: str, channel_id: int | None, title: str = ""):
+        data = self._guard_load("guard_group_channels", {})
+        rows = data.get(str(chat_id), [])
+        for row in rows:
+            if row.get("username") == username:
+                row["channel_id"] = channel_id
+                row["title"] = title or ""
+                data[str(chat_id)] = rows
+                self._guard_save("guard_group_channels", data)
+                return
+        all_rows = [item for bucket in data.values() for item in bucket]
+        rows.append({
+            "id": self._next_guard_id(all_rows),
+            "chat_id": chat_id,
+            "username": username,
+            "channel_id": channel_id,
+            "title": title or "",
+        })
+        data[str(chat_id)] = rows
+        self._guard_save("guard_group_channels", data)
+
+    def remove_group_channel(self, row_id: int) -> None:
+        data = self._guard_load("guard_group_channels", {})
+        for key, rows in data.items():
+            data[key] = [row for row in rows if int(row.get("id") or 0) != row_id]
+        self._guard_save("guard_group_channels", data)
+
+    def list_group_channels(self, chat_id: int) -> list[dict]:
+        rows = self._guard_load("guard_group_channels", {}).get(str(chat_id), [])
+        return sorted(rows, key=lambda row: row.get("username") or "")
+
+    def get_group_channel(self, row_id: int) -> Optional[dict]:
+        for rows in self._guard_load("guard_group_channels", {}).values():
+            for row in rows:
+                if int(row.get("id") or 0) == row_id:
+                    return row
+        return None
+
+    def add_global_channel(self, username: str, channel_id: int | None, title: str = ""):
+        rows = self._guard_load("guard_global_channels", [])
+        for row in rows:
+            if row.get("username") == username:
+                row["channel_id"] = channel_id
+                row["title"] = title or ""
+                self._guard_save("guard_global_channels", rows)
+                return
+        rows.append({
+            "id": self._next_guard_id(rows),
+            "username": username,
+            "channel_id": channel_id,
+            "title": title or "",
+        })
+        self._guard_save("guard_global_channels", rows)
+
+    def remove_global_channel(self, row_id: int) -> None:
+        rows = [
+            row for row in self._guard_load("guard_global_channels", [])
+            if int(row.get("id") or 0) != row_id
+        ]
+        self._guard_save("guard_global_channels", rows)
+
+    def list_global_channels(self) -> list[dict]:
+        return sorted(
+            self._guard_load("guard_global_channels", []),
+            key=lambda row: row.get("username") or "",
+        )
+
+    def get_global_channel(self, row_id: int) -> Optional[dict]:
+        for row in self._guard_load("guard_global_channels", []):
+            if int(row.get("id") or 0) == row_id:
+                return row
+        return None
 
     # ── Stats ──
 

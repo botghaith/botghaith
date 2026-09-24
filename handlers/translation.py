@@ -13,34 +13,147 @@ from services.channel_check import check_channel_for_translation
 from services.file_translator import (
     translate_file_two_modes,
     translate_image_two_modes,
-    prepare_dual_file_translation,
-    prepare_dual_image_translation,
-    build_full_file_structured,
+    prepare_full_file_translation,
+    prepare_full_image_translation,
     build_full_file_overlay,
-    build_full_image_structured,
     build_full_image_overlay,
 )
-from config import use_online_translate
+from config import (
+    use_online_translate,
+    telegram_connect_timeout,
+    telegram_read_timeout,
+    telegram_write_timeout,
+    file_download_max_attempts,
+    file_download_retry_wait,
+    file_prepare_timeout,
+    file_overlay_timeout,
+)
 from services.translator import (
     translate_text_dual,
     resolve_direction,
     direction_label,
     is_translator_ready,
 )
+from services.text_shape import (
+    set_font_scale,
+    set_translation_color,
+    FONT_SCALES,
+    FONT_LABELS,
+    DEFAULT_FONT_INDEX,
+    TRANSLATION_COLORS,
+    TRANSLATION_COLOR_LABELS,
+)
 from utils.helpers import get_user_temp_dir, truncate_text
 from utils.background_jobs import spawn_background, progress_ticker
 from utils.keyboards import (
     translation_menu,
     translation_direction_reply_menu,
+    translation_color_keyboard,
     parse_direction_text,
     MAIN_MENU,
 )
 from utils import states
+from utils.activity_log import log_user_activity
 
 logger = logging.getLogger(__name__)
 
 MSG_LIMIT = 3800
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+FONT_MINUS = "➖ تصغير الخط"
+FONT_PLUS = "➕ تكبير الخط"
+FONT_SIZE_BUTTONS = {
+    "🔠 صغير": 0,
+    "🔠 متوسط": 1,
+    "🔠 كبير": 2,
+}
+FONT_BUTTONS = set(FONT_SIZE_BUTTONS) | {FONT_MINUS, FONT_PLUS}
+
+
+def _is_font_button(text: str | None) -> bool:
+    return (text or "").strip() in FONT_BUTTONS
+
+
+def _font_index(context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        idx = int(context.user_data.get("tr_font_index", DEFAULT_FONT_INDEX))
+    except (TypeError, ValueError):
+        idx = DEFAULT_FONT_INDEX
+    return max(0, min(len(FONT_SCALES) - 1, idx))
+
+
+def _run_with_font(context: ContextTypes.DEFAULT_TYPE, fn, *args):
+    scale = FONT_SCALES[_font_index(context)]
+    color = context.user_data.get("tr_color", "black")
+
+    def _inner():
+        set_font_scale(scale)
+        set_translation_color(color)
+        try:
+            return fn(*args)
+        finally:
+            set_font_scale(1.0)
+            set_translation_color("black")
+
+    return asyncio.to_thread(_inner)
+
+
+def _stay_in_translation(context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("tr_pending"):
+        return states.TR_WAIT_COLOR
+    mode = context.user_data.get("tr_mode")
+    if context.user_data.get("tr_direction") and mode == "text":
+        return states.TR_WAIT_TEXT
+    if context.user_data.get("tr_direction") and mode == "file":
+        return states.TR_WAIT_FILE
+    if context.user_data.get("tr_direction") and mode == "image":
+        return states.TR_WAIT_IMAGE
+    if mode:
+        return states.TR_WAIT_DIRECTION
+    return ConversationHandler.END
+
+
+async def adjust_translation_font(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    idx = _font_index(context)
+    if text in FONT_SIZE_BUTTONS:
+        idx = FONT_SIZE_BUTTONS[text]
+        msg = f"✅ حجم خط الترجمة: {FONT_LABELS[idx]}"
+    elif text == FONT_PLUS:
+        if idx >= len(FONT_SCALES) - 1:
+            msg = f"حجم الخط في الحد الأقصى ({FONT_LABELS[idx]})."
+        else:
+            idx += 1
+            msg = f"✅ حجم خط الترجمة: {FONT_LABELS[idx]}"
+    elif text == FONT_MINUS:
+        if idx <= 0:
+            msg = f"حجم الخط في الحد الأدنى ({FONT_LABELS[idx]})."
+        else:
+            idx -= 1
+            msg = f"✅ حجم خط الترجمة: {FONT_LABELS[idx]}"
+    else:
+        return _stay_in_translation(context)
+    context.user_data["tr_font_index"] = idx
+    await update.message.reply_text(
+        f"{msg}\nسيُطبَّق على ملفات الترجمة التالية.",
+        reply_markup=translation_menu(),
+    )
+    return _stay_in_translation(context)
+
+
+async def _download_tg_file(status_msg, tg_file, dest: str):
+    """تحميل ملف من تيليجرام مع إعادة المحاولة."""
+    attempts = file_download_max_attempts()
+    for attempt in range(attempts):
+        try:
+            await tg_file.download_to_drive(dest)
+            return
+        except (TimedOut, NetworkError):
+            if attempt == attempts - 1:
+                raise
+            await status_msg.edit_text(
+                f"⏳ إعادة تحميل الملف... ({attempt + 2}/{attempts})"
+            )
+            await asyncio.sleep(file_download_retry_wait())
 
 
 def _split_message(text: str, limit: int = MSG_LIMIT) -> list[str]:
@@ -59,7 +172,10 @@ def _split_message(text: str, limit: int = MSG_LIMIT) -> list[str]:
     return parts or [text[:limit]]
 
 
-def setup_translation_handlers(back_to_main) -> ConversationHandler:
+def setup_translation_handlers(db=None, back_to_main=None) -> ConversationHandler:
+    if back_to_main is None and callable(db):
+        back_to_main = db
+        db = None
     async def enter_translation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await check_channel_for_translation(update, context):
             return ConversationHandler.END
@@ -70,8 +186,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             f"📚 **قسم الترجمة**\n{ready}\n\n"
             "اختر نوع الترجمة:\n"
             "• **نص** — ترجمة فورية مع عرض ثنائي اللغة\n"
-            "• **ملف** — ملفان: بنفس الترتيب + فوق الكلمات (سريع ومحلي)\n"
-            "• **صورة** — نفس الملفين بعد استخراج النص",
+            "• **ملف** — ترجمة فوق الكلمات (سريع ومحلي)\n"
+            "• **صورة** — نفس الترجمة بعد استخراج النص",
             parse_mode="Markdown",
             reply_markup=translation_menu(),
         )
@@ -102,6 +218,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
     async def set_direction_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text == "🔙 القائمة الرئيسية":
             return await back_to_main(update, context)
+        if _is_font_button(update.message.text):
+            return await adjust_translation_font(update, context)
 
         raw = parse_direction_text(update.message.text)
         if not raw:
@@ -172,6 +290,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             return await back_to_main(update, context)
 
         text = (update.message.text or "").strip()
+        if _is_font_button(text):
+            return await adjust_translation_font(update, context)
         if text in {"📝 ترجمة نص", "📁 ترجمة ملف", "🖼️ ترجمة صورة", "📚 الترجمة"}:
             await update.message.reply_text("📨 أرسل النص المراد ترجمته (مو زر القائمة).")
             return states.TR_WAIT_TEXT
@@ -188,7 +308,7 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
 
         try:
             interleaved, full_tr = await asyncio.wait_for(
-                asyncio.to_thread(translate_text_dual, text, actual_dir),
+                _run_with_font(context, translate_text_dual, text, actual_dir),
                 timeout=90.0,
             )
             header = (
@@ -210,6 +330,11 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
                 f"📝 الترجمة الكاملة:\n\n{truncate_text(full_tr, 3500)}",
                 reply_markup=translation_menu(),
             )
+            if db:
+                log_user_activity(
+                    db, user_id, "translate_text",
+                    f"{direction_label(actual_dir)} — {len(text)} حرف",
+                )
         except asyncio.TimeoutError:
             await update.message.reply_text(
                 "❌ انتهت مهلة الترجمة — جرّب نصاً أقصر.",
@@ -232,11 +357,10 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
     async def _send_translation_outputs(context, chat_id: int, outputs: dict, source_label: str):
         captions = {
             "literal": "1️⃣ حرفي — PDF (كلمة وترجمتها بجانب بعض)",
-            "structured": "2️⃣ نفس ترتيب الصورة/الملف — مترجم بالكامل",
             "line_pairs": "3️⃣ سطر بسطر — كل سطر وترجمته تحته",
-            "overlay": "4️⃣ فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
+            "overlay": "فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
         }
-        send_order = ("literal", "structured", "line_pairs", "overlay")
+        send_order = ("literal", "line_pairs", "overlay")
         for key in send_order:
             path = outputs.get(key)
             if not path:
@@ -251,11 +375,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
 
         await context.bot.send_message(
             chat_id,
-            f"✅ تم إنشاء ملفات ترجمة {source_label}!\n\n"
-            "1️⃣ حرفي — PDF\n"
-            "2️⃣ بنفس الترتيب — مترجم بالكامل\n"
-            "3️⃣ سطر بسطر — أصل وترجمة\n"
-            "4️⃣ فوق الكلمات — ترجمة فوق كل كلمة",
+            f"✅ تم إنشاء ترجمة {source_label}!\n\n"
+            "فوق الكلمات — ترجمة فوق كل كلمة",
             reply_markup=translation_menu(),
         )
 
@@ -269,56 +390,80 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             )
 
     async def _translate_file_streaming(
-        context, chat_id: int, file_path: Path, user_dir: Path,
+        context, chat_id: int, user_id: int, file_path: Path, user_dir: Path,
         direction: str, status_msg_id: int, *, image: bool = False,
     ):
-        """ملفان: بنفس الترتيب + فوق الكلمات — Argos محلي."""
+        """ترجمة فوق الكلمات — Argos محلي."""
         captions = {
-            "structured": "1️⃣ بنفس ترتيب الملف — مترجم بالكامل",
-            "overlay": "2️⃣ فوق الكلمات — ترجمة صغيرة فوق كل كلمة",
+            "overlay": "فوق كل كلمة — ترجمة صغيرة فوق كل كلمة",
         }
         if image:
-            prepare_fn = prepare_dual_image_translation
+            prepare_fn = prepare_full_image_translation
             steps = [
-                ("structured", build_full_image_structured, "⏳ الملف 1: ترجمة بنفس ترتيب الصورة..."),
-                ("overlay", build_full_image_overlay, "⏳ الملف 2: ترجمة فوق الكلمات..."),
+                ("overlay", build_full_image_overlay, "⏳ جاري الترجمة فوق كل كلمة..."),
             ]
         else:
-            prepare_fn = prepare_dual_file_translation
+            prepare_fn = prepare_full_file_translation
             steps = [
-                ("structured", build_full_file_structured, "⏳ الملف 1: ترجمة بنفس ترتيب الملف..."),
-                ("overlay", build_full_file_overlay, "⏳ الملف 2: ترجمة فوق الكلمات..."),
+                ("overlay", build_full_file_overlay, "⏳ جاري الترجمة فوق كل كلمة..."),
             ]
         label = "الصورة" if image else "الملف"
 
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg_id,
-            text="⏳ جاري تحميل محرك Argos المحلي...\n"
-            "🔒 ترجمة مباشرة على Render — بدون إنترنت.",
+            text="⏳ جاري استخراج النص وتحضير الترجمة...\n"
+            "🔒 Argos محلي على Render",
         )
         data = await asyncio.wait_for(
-            asyncio.to_thread(prepare_fn, file_path, user_dir, direction),
-            timeout=300.0,
+            _run_with_font(context, prepare_fn, file_path, user_dir, direction),
+            timeout=file_prepare_timeout(),
         )
 
+        sent = 0
         for key, builder, msg in steps:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=status_msg_id, text=msg,
             )
-            path = await asyncio.wait_for(
-                asyncio.to_thread(builder, data),
-                timeout=1800.0,
-            )
-            await _send_one_output(context, chat_id, path, captions[key])
+            try:
+                path = await asyncio.wait_for(
+                    _run_with_font(context, builder, data),
+                    timeout=file_overlay_timeout(),
+                )
+                await _send_one_output(context, chat_id, path, captions[key])
+                sent += 1
+            except asyncio.TimeoutError:
+                logger.warning("Translation step %s timed out for %s", key, file_path.name)
+                await context.bot.send_message(
+                    chat_id,
+                    "⚠️ الترجمة فوق الكلمات استغرقت وقتاً طويلاً.\n"
+                    "جرّب ملفاً أصغر أو أعد المحاولة.",
+                )
+            except Exception as e:
+                logger.exception("Translation step %s failed: %s", key, e)
+                err = str(e).strip() or e.__class__.__name__
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ فشل إنشاء ملف الترجمة فوق الكلمات.\n{err[:240]}",
+                )
 
+        if sent >= 1:
+            done_text = (
+                f"✅ تم إرسال ترجمة {label}!\n\n"
+                "فوق كل كلمة — ترجمة صغيرة فوق كل كلمة"
+            )
+        else:
+            done_text = f"❌ لم يتم إرسال ترجمة {label}."
         await context.bot.send_message(
-            chat_id,
-            f"✅ تم إرسال ملفي ترجمة {label}!\n\n"
-            "1️⃣ بنفس الترتيب — الملف كاملاً مترجم\n"
-            "2️⃣ فوق الكلمات — ترجمة فوق كل كلمة بدون تغيير الشكل",
-            reply_markup=translation_menu(),
+            chat_id, done_text, reply_markup=translation_menu(),
         )
+        if sent >= 1:
+            action = "translate_image" if image else "translate_file"
+            if db:
+                log_user_activity(
+                    db, user_id, action,
+                    f"{file_path.name} — overlay",
+                )
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
         except Exception:
@@ -345,7 +490,7 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
         try:
             fn = translate_image_two_modes if image else translate_file_two_modes
             outputs = await asyncio.wait_for(
-                asyncio.to_thread(fn, media_path, user_dir, direction),
+                _run_with_font(context, fn, media_path, user_dir, direction),
                 timeout=job_timeout,
             )
         except Exception:
@@ -377,7 +522,7 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
         user_dir: Path, direction: str, status_msg_id: int,
     ):
         await _translate_file_streaming(
-            context, chat_id, file_path, user_dir, direction, status_msg_id,
+            context, chat_id, user_id, file_path, user_dir, direction, status_msg_id,
         )
 
     async def _translate_image_job(
@@ -385,7 +530,7 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
         user_dir: Path, direction: str, status_msg_id: int,
     ):
         await _translate_file_streaming(
-            context, chat_id, image_path, user_dir, direction, status_msg_id,
+            context, chat_id, user_id, image_path, user_dir, direction, status_msg_id,
             image=True,
         )
 
@@ -402,6 +547,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
     async def translate_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text == "🔙 القائمة الرئيسية":
             return await back_to_main(update, context)
+        if _is_font_button(update.message.text):
+            return await adjust_translation_font(update, context)
 
         doc = update.message.document
         if not doc:
@@ -430,50 +577,23 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
 
         try:
             tg_file = await doc.get_file()
-            for attempt in range(5):
-                try:
-                    await tg_file.download_to_drive(str(file_path))
-                    break
-                except (TimedOut, NetworkError):
-                    if attempt == 4:
-                        raise
-                    await status.edit_text(f"⏳ إعادة تحميل الملف... ({attempt + 2}/5)")
-                    await asyncio.sleep(5)
+            await _download_tg_file(status, tg_file, str(file_path))
 
-            await status.edit_text(
-                "📄 تم التحميل — جاري الترجمة في الخلفية...\n"
-                "💡 يمكنك الانتقال للقائمة الرئيسية أو استخدام خدمة أخرى."
+            await status.edit_text("📄 تم تحميل الملف.")
+            context.user_data["tr_pending"] = {
+                "path": str(file_path),
+                "user_dir": str(user_dir),
+                "image": False,
+                "status_id": status.message_id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "direction": direction,
+            }
+            await update.message.reply_text(
+                "🎨 اختر لون الترجمة قبل الإنشاء:",
+                reply_markup=translation_color_keyboard(),
             )
-
-            async def _job():
-                try:
-                    await _translate_file_job(
-                        context, chat_id, user_id, file_path,
-                        user_dir, direction, status.message_id,
-                    )
-                except asyncio.TimeoutError:
-                    await context.bot.send_message(
-                        chat_id,
-                        "❌ انتهت مهلة ترجمة الملف (15 دقيقة).\n"
-                        "جرّب ملفاً أصغر أو TXT.",
-                        reply_markup=translation_menu(),
-                    )
-                except (TimedOut, NetworkError):
-                    await context.bot.send_message(
-                        chat_id,
-                        "❌ انتهت مهلة تحميل/معالجة الملف.\n"
-                        "حاول مرة أخرى بملف أصغر أو اتصال أسرع.",
-                        reply_markup=translation_menu(),
-                    )
-                except Exception as e:
-                    logger.error(f"File translation error: {e}", exc_info=True)
-                    await context.bot.send_message(
-                        chat_id,
-                        f"❌ خطأ في الترجمة: {e}",
-                        reply_markup=translation_menu(),
-                    )
-
-            spawn_background(_job(), label=f"translate_file:{user_id}")
+            return states.TR_WAIT_COLOR
         except (TimedOut, NetworkError):
             logger.error("File download timed out")
             await status.edit_text(
@@ -491,6 +611,8 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
     async def translate_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text == "🔙 القائمة الرئيسية":
             return await back_to_main(update, context)
+        if _is_font_button(update.message.text):
+            return await adjust_translation_font(update, context)
 
         user_dir = get_user_temp_dir(update.effective_user.id)
         chat_id = update.effective_chat.id
@@ -503,10 +625,10 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             image_path = user_dir / f"tr_img_{photo.file_id}.jpg"
             status = await update.message.reply_text(
                 "⏳ جاري تحميل الصورة...\n"
-                "📌 تُترجم في الخلفية بـ 4 صيغ — يمكنك استخدام البوت بحرية."
+                "📌 تُترجم في الخلفية — يمكنك استخدام البوت بحرية."
             )
             tg_file = await photo.get_file()
-            await tg_file.download_to_drive(str(image_path))
+            await _download_tg_file(status, tg_file, str(image_path))
         elif update.message.document:
             doc = update.message.document
             suffix = Path(doc.file_name or "").suffix.lower()
@@ -519,7 +641,7 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             image_path = user_dir / doc.file_name
             status = await update.message.reply_text("⏳ جاري تحميل الصورة...")
             tg_file = await doc.get_file()
-            await tg_file.download_to_drive(str(image_path))
+            await _download_tg_file(status, tg_file, str(image_path))
         else:
             await update.message.reply_text(
                 "❌ أرسل صورة (JPG / PNG) أو ارفعها كملف.",
@@ -527,40 +649,107 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
             )
             return states.TR_WAIT_IMAGE
 
-        await status.edit_text(
-            "🖼️ تم التحميل — جاري استخراج النص والترجمة في الخلفية...\n"
-            "💡 يمكنك الانتقال للقائمة الرئيسية أو استخدام خدمة أخرى."
+        await status.edit_text("🖼️ تم تحميل الصورة.")
+        context.user_data["tr_pending"] = {
+            "path": str(image_path),
+            "user_dir": str(user_dir),
+            "image": True,
+            "status_id": status.message_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "direction": direction,
+        }
+        await update.message.reply_text(
+            "🎨 اختر لون الترجمة قبل الإنشاء:",
+            reply_markup=translation_color_keyboard(),
         )
+        return states.TR_WAIT_COLOR
+
+    async def receive_translation_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        name = (query.data or "").removeprefix("tr_color_")
+        if name not in TRANSLATION_COLORS:
+            return states.TR_WAIT_COLOR
+        pending = context.user_data.get("tr_pending")
+        if not pending:
+            await query.edit_message_text("❌ لا يوجد ملف للترجمة. أرسل الملف أو الصورة من جديد.")
+            return ConversationHandler.END
+
+        context.user_data["tr_color"] = name
+        label = TRANSLATION_COLOR_LABELS.get(name, name)
+        try:
+            await query.edit_message_text(f"✅ لون الترجمة: {label}\n⏳ جاري الترجمة...")
+        except Exception:
+            pass
+
+        file_path = Path(pending["path"])
+        user_dir = Path(pending["user_dir"])
+        chat_id = pending["chat_id"]
+        user_id = pending["user_id"]
+        direction = pending["direction"]
+        status_id = pending["status_id"]
+        is_image = bool(pending.get("image"))
+        context.user_data.pop("tr_pending", None)
 
         async def _job():
             try:
-                await _translate_image_job(
-                    context, chat_id, user_id, image_path,
-                    user_dir, direction, status.message_id,
-                )
+                if is_image:
+                    await _translate_image_job(
+                        context, chat_id, user_id, file_path,
+                        user_dir, direction, status_id,
+                    )
+                else:
+                    await _translate_file_job(
+                        context, chat_id, user_id, file_path,
+                        user_dir, direction, status_id,
+                    )
             except asyncio.TimeoutError:
                 await context.bot.send_message(
                     chat_id,
-                    "❌ انتهت مهلة ترجمة الصورة (15 دقيقة).\n"
-                    "جرّب صورة أصغر.",
+                    "❌ انتهت مهلة ترجمة الصورة (15 دقيقة).\nجرّب صورة أصغر."
+                    if is_image else
+                    "❌ انتهت مهلة ترجمة الملف.\nجرّب ملفاً أصغر أو TXT.",
+                    reply_markup=translation_menu(),
+                )
+            except (TimedOut, NetworkError):
+                await context.bot.send_message(
+                    chat_id,
+                    "❌ انتهت مهلة تحميل/معالجة الملف.\n"
+                    "حاول مرة أخرى بملف أصغر أو اتصال أسرع.",
                     reply_markup=translation_menu(),
                 )
             except RuntimeError as e:
                 await context.bot.send_message(
-                    chat_id,
-                    f"❌ {e}",
-                    reply_markup=translation_menu(),
+                    chat_id, f"❌ {e}", reply_markup=translation_menu(),
                 )
             except Exception as e:
-                logger.error(f"Image translation error: {e}", exc_info=True)
+                logger.error("Translation after color failed: %s", e, exc_info=True)
                 await context.bot.send_message(
                     chat_id,
-                    f"❌ خطأ في ترجمة الصورة: {e}",
+                    f"❌ خطأ في الترجمة: {e}",
                     reply_markup=translation_menu(),
                 )
 
-        spawn_background(_job(), label=f"translate_image:{user_id}")
+        spawn_background(
+            _job(),
+            label=f"translate_{'image' if is_image else 'file'}:{user_id}",
+        )
         return ConversationHandler.END
+
+    async def remind_pick_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message and _is_font_button(update.message.text):
+            return await adjust_translation_font(update, context)
+        await update.message.reply_text(
+            "🎨 اختر لون الترجمة من الأزرار أولاً:",
+            reply_markup=translation_color_keyboard(),
+        )
+        return states.TR_WAIT_COLOR
+
+    font_handler = MessageHandler(
+        filters.Regex("^🔠 صغير$|^🔠 متوسط$|^🔠 كبير$|^➖ تصغير الخط$|^➕ تكبير الخط$"),
+        adjust_translation_font,
+    )
 
     return ConversationHandler(
         entry_points=[
@@ -569,9 +758,11 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
                 filters.Regex("^📝 ترجمة نص$|^📁 ترجمة ملف$|^🖼️ ترجمة صورة$"),
                 ask_direction,
             ),
+            font_handler,
         ],
         states={
             states.TR_WAIT_DIRECTION: [
+                font_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND, set_direction_message),
                 MessageHandler(
                     filters.Document.ALL | filters.PHOTO,
@@ -580,15 +771,26 @@ def setup_translation_handlers(back_to_main) -> ConversationHandler:
                 CallbackQueryHandler(set_direction, pattern="^tr_dir_"),
             ],
             states.TR_WAIT_TEXT: [
+                font_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND, translate_text_handler),
             ],
             states.TR_WAIT_FILE: [
+                font_handler,
                 MessageHandler(filters.Document.ALL, translate_file_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, translate_file_handler),
             ],
             states.TR_WAIT_IMAGE: [
+                font_handler,
                 MessageHandler(filters.PHOTO | filters.Document.ALL, translate_image_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, translate_image_handler),
+            ],
+            states.TR_WAIT_COLOR: [
+                font_handler,
+                CallbackQueryHandler(receive_translation_color, pattern="^tr_color_(black|red|blue|green)$"),
+                MessageHandler(
+                    filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND),
+                    remind_pick_color,
+                ),
             ],
         },
         fallbacks=[

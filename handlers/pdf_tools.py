@@ -11,6 +11,7 @@ from services.ocr_service import EXTRACT_TIMEOUT, extract_text_smart
 from services.pdf_service import (
     images_to_pdf, pdf_to_images, word_to_pdf, pdf_to_word,
     merge_pdfs, split_pdf, compress_pdf, reorder_pdf_pages, create_text_pdf,
+    slides_two_per_page, SLIDE_EXTS,
 )
 from utils.helpers import get_user_temp_dir, split_text_chunks, sanitize_text_for_send
 from utils.background_jobs import spawn_background
@@ -48,6 +49,11 @@ def setup_pdf_handlers(db: Database, back_to_main) -> ConversationHandler:
             "🗜️ ضغط PDF": (states.PDF_COMPRESS, "أرسل ملف PDF للضغط"),
             "📖 استخراج نص": (states.PDF_EXTRACT, "أرسل صورة أو PDF — يُرسل النص + ملف PDF بنفس الترتيب"),
             "🔄 إعادة ترتيب": (states.PDF_REORDER, "أرسل ملف PDF ثم أرسل ترتيب الصفحات (مثال: 3,1,2)"),
+            "📑 دمج سلايدات": (
+                states.PDF_SLIDES_NUP,
+                "أرسل ملف بوربوينت (PPT / PPTX) أو PDF بالعرض.\n"
+                "سيتم وضع كل شريحتين في صفحة واحدة مثل الملازم.",
+            ),
         }
 
         text = update.message.text
@@ -64,7 +70,19 @@ def setup_pdf_handlers(db: Database, back_to_main) -> ConversationHandler:
         doc = update.message.document
         if not doc:
             return None
-        path = user_dir / doc.file_name
+        name = doc.file_name or f"file_{doc.file_id}"
+        path = user_dir / name
+        if not path.suffix:
+            mime = (doc.mime_type or "").lower()
+            mime_ext = {
+                "application/pdf": ".pdf",
+                "application/vnd.ms-powerpoint": ".ppt",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow": ".ppsx",
+                "application/vnd.ms-powerpoint.slideshow.macroenabled.12": ".pps",
+            }
+            if mime in mime_ext:
+                path = user_dir / f"{path.name}{mime_ext[mime]}"
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(str(path))
         return path
@@ -491,11 +509,54 @@ def setup_pdf_handlers(db: Database, back_to_main) -> ConversationHandler:
             await update.message.reply_text(f"❌ خطأ في الترتيب: {e}\nحاول مرة أخرى (مثال: 2,1,3)")
             return states.PDF_REORDER
 
+    async def handle_slides_nup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_dir = get_user_temp_dir(update.effective_user.id)
+        path = await _download_doc(update, user_dir)
+        if not path:
+            await update.message.reply_text("❌ أرسل ملف بوربوينت أو PDF.")
+            return states.PDF_SLIDES_NUP
+        if path.suffix.lower() not in SLIDE_EXTS:
+            await update.message.reply_text(
+                "❌ المدعوم: PPT, PPTX, PPS, PPSX, PDF",
+            )
+            return states.PDF_SLIDES_NUP
+
+        status = await update.message.reply_text(
+            "⏳ جاري دمج كل شريحتين في صفحة واحدة..." + BG_HINT
+        )
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        out = user_dir / f"{path.stem}_2slides.pdf"
+
+        async def _job():
+            try:
+                await asyncio.to_thread(slides_two_per_page, path, out)
+                with open(out, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id,
+                        document=f,
+                        filename=out.name,
+                        caption="✅ كل شريحتين في صفحة واحدة",
+                    )
+                await context.bot.send_message(chat_id, "✅ تم!", reply_markup=pdf_menu())
+                db.log_activity(user_id, "pdf_slides_nup")
+            except Exception as e:
+                logger.error("slides_nup error: %s", e, exc_info=True)
+                await context.bot.send_message(chat_id, f"❌ خطأ: {e}", reply_markup=pdf_menu())
+            finally:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+
+        spawn_background(_job(), label=f"pdf_slides:{user_id}")
+        return ConversationHandler.END
+
     return ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^📄 أدوات PDF$"), enter_pdf),
             MessageHandler(
-                filters.Regex("^🖼️ صور → PDF$|^📷 PDF → صور$|^📄 Word → PDF$|^📝 PDF → Word$|^🔗 دمج PDF$|^✂️ تقسيم PDF$|^🗜️ ضغط PDF$|^📖 استخراج نص$|^🔄 إعادة ترتيب$"),
+                filters.Regex("^🖼️ صور → PDF$|^📷 PDF → صور$|^📄 Word → PDF$|^📝 PDF → Word$|^🔗 دمج PDF$|^✂️ تقسيم PDF$|^🗜️ ضغط PDF$|^📖 استخراج نص$|^🔄 إعادة ترتيب$|^📑 دمج سلايدات$"),
                 select_tool,
             ),
         ],
@@ -526,6 +587,9 @@ def setup_pdf_handlers(db: Database, back_to_main) -> ConversationHandler:
             ],
             states.PDF_REORDER: [
                 MessageHandler(filters.Document.ALL | filters.TEXT, handle_reorder),
+            ],
+            states.PDF_SLIDES_NUP: [
+                MessageHandler(filters.Document.ALL, handle_slides_nup),
             ],
         },
         fallbacks=[

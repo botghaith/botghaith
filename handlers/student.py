@@ -7,6 +7,7 @@ from database.db import Database
 from services.channel_check import check_channel_subscription
 from utils.helpers import format_percentage
 from utils.keyboards import MAIN_MENU
+from utils.activity_log import log_user_activity
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +36,21 @@ def setup_student_handlers(db: Database) -> list:
         if results:
             avg_score = sum(r["percentage"] for r in results) / len(results)
 
-        text = f"""🧑‍🎓 **ملفي الشخصي**
-
-👤 الاسم: {profile.get('full_name', '—')}
-🆔 المعرف: @{profile.get('username', '—')}
-⭐ النقاط: {profile['points']}
-📝 الامتحانات: {profile['exams_taken']}
-🏆 الترتيب: #{rank}
-📈 متوسط الدرجات: {format_percentage(avg_score) if results else '—'}
-📅 تاريخ التسجيل: {profile['created_at'][:10]}
-"""
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_MENU)
+        uname = (profile.get("username") or "").strip().lstrip("@")
+        handle = f"@{uname}" if uname else "بدون يوزر"
+        text = (
+            "🧑‍🎓 ملفي الشخصي\n\n"
+            f"👤 الاسم: {profile.get('full_name') or '—'}\n"
+            f"🆔 اليوزر: {handle}\n"
+            f"🔢 المعرف: {profile.get('user_id', user.id)}\n"
+            f"⭐ النقاط: {profile['points']}\n"
+            f"📝 الامتحانات: {profile['exams_taken']}\n"
+            f"🏆 الترتيب: #{rank}\n"
+            f"📈 متوسط الدرجات: {format_percentage(avg_score) if results else '—'}\n"
+            f"📅 تاريخ التسجيل: {str(profile.get('created_at') or '')[:10]}"
+        )
+        await update.message.reply_text(text, reply_markup=MAIN_MENU)
+        log_user_activity(db, user.id, "view_profile")
 
     async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await check_channel_subscription(update, context, db):
@@ -53,9 +58,11 @@ def setup_student_handlers(db: Database) -> list:
         help_text = """ℹ️ **دليل استخدام البوت**
 
 📚 **الترجمة** — ترجمة نصوص وملفات وصور (عربي ↔ إنجليزي)
-📄 **أدوات PDF** — تحويل، دمج، تقسيم، ضغط
+📋 **واجهة تقرير** — غلاف أكاديمي PDF أو Word
+📄 **أدوات PDF** — تحويل، دمج، تقسيم، ضغط، سلايدات
 📝 **الامتحانات** — اختبارات إلكترونية مع تصحيح تلقائي
 🧑‍🎓 **حسابي** — نقاطك ونتائجك وترتيبك
+🛡️ **حماية الكروبات** — منع تحويل وروابط القنوات غير المسموحة
 
 من إعداد **المهندس غيث اسعد**"""
         await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=MAIN_MENU)

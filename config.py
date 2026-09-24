@@ -12,7 +12,7 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "bot.db"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "qhaith").lstrip("@").lower()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://qusavnejgrcxuuyunrry.supabase.co")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 SUPABASE_JWKS_URL = os.getenv("SUPABASE_JWKS_URL", "")
@@ -68,6 +68,39 @@ def is_render_host() -> bool:
 def file_max_paragraphs() -> int:
     return int(os.getenv("FILE_MAX_PARAGRAPHS", "120"))
 
+
+def telegram_connect_timeout() -> float:
+    return float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "180"))
+
+
+def telegram_read_timeout() -> float:
+    return float(os.getenv("TELEGRAM_READ_TIMEOUT", "1200"))
+
+
+def telegram_write_timeout() -> float:
+    return float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "1200"))
+
+
+def file_download_max_attempts() -> int:
+    return int(os.getenv("FILE_DOWNLOAD_MAX_ATTEMPTS", "8"))
+
+
+def file_download_retry_wait() -> float:
+    return float(os.getenv("FILE_DOWNLOAD_RETRY_WAIT", "10"))
+
+
+def file_prepare_timeout() -> float:
+    return float(os.getenv("FILE_PREPARE_TIMEOUT", "300"))
+
+
+def file_structured_timeout() -> float:
+    return float(os.getenv("FILE_STRUCTURED_TIMEOUT", "900"))
+
+
+def file_overlay_timeout() -> float:
+    return float(os.getenv("FILE_OVERLAY_TIMEOUT", "1800"))
+
+
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "mcqthr").lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/mcqthr")
 CHANNEL_REQUIRED = os.getenv("CHANNEL_REQUIRED", "1") == "1"
@@ -80,6 +113,7 @@ WELCOME_MESSAGE = """مرحباً بك! 👋
 اختر القسم الذي تريده من القائمة أدناه:
 
 📚 الترجمة — نصوص وملفات
+📋 واجهة تقرير — غلاف PDF / Word
 📄 أدوات PDF والملفات
 📝 الامتحانات الإلكترونية
 🧑‍🎓 حسابي الطلابي

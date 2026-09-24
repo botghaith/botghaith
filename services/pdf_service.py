@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-from services.text_shape import has_arabic, shape_for_pdf
+from services.text_shape import has_arabic, shape_for_pdf, scaled_pt
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,122 @@ def merge_pdfs(pdf_paths: list[Path], output_path: Path):
     merged.close()
 
 
+SLIDE_EXTS = {".pdf", ".ppt", ".pptx", ".pps", ".ppsx"}
+
+
+def _find_soffice() -> str | None:
+    import shutil
+    for name in ("soffice", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for p in (
+        "/usr/bin/soffice",
+        "/usr/bin/libreoffice",
+        "/usr/lib/libreoffice/program/soffice",
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ):
+        if Path(p).exists():
+            return p
+    return None
+
+
+def convert_office_to_pdf(source: Path, output_dir: Path) -> Path:
+    """تحويل بوربوينت/أوفيس إلى PDF عبر LibreOffice."""
+    import subprocess
+
+    soffice = _find_soffice()
+    if not soffice:
+        raise RuntimeError(
+            "تحويل بوربوينت يحتاج LibreOffice. صدّر الملف PDF من PowerPoint وأعد الإرسال."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profile = output_dir / f"lo_profile_{source.stem}"
+    profile.mkdir(parents=True, exist_ok=True)
+    profile_uri = profile.resolve().as_posix().replace(" ", "%20")
+    if not profile_uri.startswith("/"):
+        profile_uri = "/" + profile_uri
+    cmd = [
+        soffice,
+        "--headless",
+        "--nologo",
+        "--nofirststartwizard",
+        "--norestore",
+        f"-env:UserInstallation=file://{profile_uri}",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(output_dir),
+        str(source),
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    pdf = output_dir / f"{source.stem}.pdf"
+    if not pdf.exists():
+        err = (result.stderr or result.stdout or "").strip()[:400]
+        raise RuntimeError(f"فشل تحويل بوربوينت إلى PDF. {err}".strip())
+    return pdf
+
+
+def nup_two_slides_per_page(pdf_path: Path, output_path: Path) -> Path:
+    """وضع كل صفحتين (سلايدات بالعرض) في صفحة A4 عمودية واحدة."""
+    import fitz
+
+    src = fitz.open(str(pdf_path))
+    if len(src) == 0:
+        src.close()
+        raise RuntimeError("الملف فارغ.")
+
+    a4 = fitz.paper_rect("a4")
+    margin = 16
+    gap = 12
+    slot_w = a4.width - 2 * margin
+    slot_h = (a4.height - 2 * margin - gap) / 2
+    out = fitz.open()
+
+    for i in range(0, len(src), 2):
+        page = out.new_page(width=a4.width, height=a4.height)
+        for k in range(2):
+            idx = i + k
+            if idx >= len(src):
+                break
+            rect = src[idx].rect
+            if rect.width <= 0 or rect.height <= 0:
+                continue
+            scale = min(slot_w / rect.width, slot_h / rect.height)
+            w = rect.width * scale
+            h = rect.height * scale
+            x0 = (a4.width - w) / 2
+            y0 = margin + k * (slot_h + gap) + (slot_h - h) / 2
+            dest = fitz.Rect(x0, y0, x0 + w, y0 + h)
+            page.show_pdf_page(dest, src, idx)
+            page.draw_rect(dest, color=(0.72, 0.72, 0.72), width=0.5)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out.save(str(output_path), deflate=True)
+    out.close()
+    src.close()
+    return output_path
+
+
+def slides_two_per_page(source: Path, output_path: Path) -> Path:
+    """بوربوينت أو PDF بالعرض → PDF كل شريحتين في صفحة."""
+    ext = source.suffix.lower()
+    if ext not in SLIDE_EXTS:
+        raise RuntimeError("أرسل ملف بوربوينت (PPT/PPTX) أو PDF.")
+    work_dir = output_path.parent
+    pdf_path = source
+    if ext != ".pdf":
+        pdf_path = convert_office_to_pdf(source, work_dir)
+    return nup_two_slides_per_page(pdf_path, output_path)
+
+
 def split_pdf(pdf_path: Path, output_dir: Path) -> list[Path]:
     import fitz
     doc = fitz.open(str(pdf_path))
@@ -132,17 +248,19 @@ def create_bilingual_pdf(text: str, output_path: Path, title: str = ""):
     font_name = _set_font(c)
 
     if title:
-        c.setFont(font_name, 16)
+        c.setFont(font_name, scaled_pt(16))
         for line in _pdf_lines(title, 70):
             if y < 60:
                 c.showPage()
                 y = height - 50
                 _set_font(c)
             c.drawRightString(width - 50, y, line) if has_arabic(line) else c.drawString(50, y, line)
-            y -= 22
+            y -= scaled_pt(22)
         y -= 10
         _set_font(c)
 
+    body = scaled_pt(11)
+    gap = scaled_pt(16)
     for line in text.split("\n"):
         if y < 60:
             c.showPage()
@@ -151,17 +269,19 @@ def create_bilingual_pdf(text: str, output_path: Path, title: str = ""):
         if not line.strip():
             y -= 10
             continue
+        c.setFont(font_name, body)
         for w in _pdf_lines(line, 85):
             if y < 60:
                 c.showPage()
                 y = height - 50
                 _set_font(c)
+                c.setFont(font_name, body)
             shaped = shape_for_pdf(w)
             if has_arabic(shaped):
                 c.drawRightString(width - 50, y, shaped)
             else:
                 c.drawString(50, y, shaped)
-            y -= 16
+            y -= gap
         y -= 2
 
     c.save()
@@ -206,7 +326,7 @@ def create_pairs_pdf(
     font_name = _set_font(c)
 
     if title:
-        y = _draw_wrapped(c, width, y, height, title, font_name, 15, has_arabic(title))
+        y = _draw_wrapped(c, width, y, height, title, font_name, scaled_pt(15), has_arabic(title))
         y -= 8
         c.setStrokeColor(colors.grey)
         c.line(55, y, width - 55, y)
@@ -214,26 +334,28 @@ def create_pairs_pdf(
 
     src_rtl = direction == "ar_en"
     tr_rtl = direction == "en_ar"
+    body = scaled_pt(12)
+    label_sz = scaled_pt(10)
 
     for i, (src, tr) in enumerate(pairs, 1):
         y = _ensure_page(c, y, height, font_name)
-        c.setFont(font_name, 9)
+        c.setFont(font_name, scaled_pt(9))
         c.setFillColor(colors.HexColor("#555555"))
         label = shape_for_pdf(f"— {i} —") if has_arabic(f"— {i} —") else f"— {i} —"
         c.drawString(55, y, label)
         y -= 16
         c.setFillColor(colors.black)
 
-        c.setFont(font_name, 10)
+        c.setFont(font_name, label_sz)
         c.drawString(55, y, "Original / الأصل:")
         y -= 14
-        y = _draw_wrapped(c, width, y, height, src, font_name, 12, src_rtl)
+        y = _draw_wrapped(c, width, y, height, src, font_name, body, src_rtl)
 
         y -= 4
-        c.setFont(font_name, 10)
+        c.setFont(font_name, label_sz)
         c.drawString(55, y, "Translation / الترجمة:")
         y -= 14
-        y = _draw_wrapped(c, width, y, height, tr, font_name, 12, tr_rtl)
+        y = _draw_wrapped(c, width, y, height, tr, font_name, body, tr_rtl)
 
         y -= 6
         c.setStrokeColor(colors.HexColor("#CCCCCC"))
@@ -260,12 +382,13 @@ def create_literal_pdf(
     font_name = _set_font(c)
 
     if title:
-        y = _draw_wrapped(c, width, y, height, title, font_name, 15, has_arabic(title))
+        y = _draw_wrapped(c, width, y, height, title, font_name, scaled_pt(15), has_arabic(title))
         y -= 12
 
+    body = scaled_pt(11)
     for sec_title, pairs in sections:
         y = _ensure_page(c, y, height, font_name)
-        c.setFont(font_name, 11)
+        c.setFont(font_name, body)
         c.setFillColor(colors.HexColor("#1a5276"))
         sec = shape_for_pdf(sec_title) if has_arabic(sec_title) else sec_title
         c.drawString(55, y, sec)
@@ -279,7 +402,7 @@ def create_literal_pdf(
             y = _ensure_page(c, y, height, font_name)
             line = f"{word}  —  {tr}"
             rtl = has_arabic(tr) or has_arabic(word)
-            y = _draw_wrapped(c, width, y, height, line, font_name, 11, rtl)
+            y = _draw_wrapped(c, width, y, height, line, font_name, body, rtl)
             y -= 2
         y -= 10
 
