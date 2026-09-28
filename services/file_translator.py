@@ -577,7 +577,20 @@ def _translate_image_online_full(
 OVERLAY_TR_SIZE = 6
 OVERLAY_TR_SIZE_PDF = 7
 OVERLAY_WORD_SIZE = 11
-OVERLAY_LINE_SPACING = 0.85
+OVERLAY_LINE_SPACING = 0.68
+
+
+def _nudge_run_down(run, points: float):
+    """ينزل الترجمة شوي باتجاه الكلمة. القيمة بنصف نقطة."""
+    half_points = -int(round(points * 2))
+    if half_points == 0:
+        return
+    r_pr = run._element.get_or_add_rPr()
+    pos = r_pr.find(qn("w:position"))
+    if pos is None:
+        pos = OxmlElement("w:position")
+        r_pr.append(pos)
+    pos.set(qn("w:val"), str(half_points))
 
 
 def _colorize_overlay_run(run):
@@ -691,8 +704,8 @@ def _pdf_insert_translation_above(page, x0, y0, x1, y1, text: str, fontfile: str
         tw = _text_width(fs)
 
     x = max(x0, x1 - tw) if rtl else x0
-    # baseline قريب جداً من أعلى الكلمة — مسافة ضئيلة بين الترجمة والكلمة
-    y = y0 + fs * 0.12
+    # أقرب للكلمة، مع حد حتى ما تنزل على جسم الكلمة أو السطر اللي فوقها
+    y = y0 + min(fs * 0.46, word_h * 0.20)
 
     try:
         page.insert_text((x, y), display, fontsize=fs, color=translation_color_rgb(), **font_kwargs)
@@ -722,6 +735,7 @@ def _add_overlay_runs_at_index(
             set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
             tr_run.font.superscript = True
             tr_run.font.size = Pt(tr_sz)
+            _nudge_run_down(tr_run, 1.5)
             _colorize_overlay_run(tr_run)
         for token in group:
             if not WORD_CHAR_RE.search(token):
@@ -793,6 +807,7 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
             tr_run = p.add_run(tr)
             tr_sz = scaled_pt(OVERLAY_TR_SIZE)
             set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
+            _nudge_run_down(tr_run, 2)
             _colorize_overlay_run(tr_run)
             br_run = p.add_run()
             br_run.add_break()
@@ -800,7 +815,7 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
         w_run = p.add_run(" ".join(group))
         set_run_font(w_run, "Tahoma", OVERLAY_WORD_SIZE)
 
-    row_h = scaled_pt(OVERLAY_TR_SIZE) + OVERLAY_WORD_SIZE + 1
+    row_h = scaled_pt(OVERLAY_TR_SIZE) + OVERLAY_WORD_SIZE
     _set_row_exact_height(table.rows[0], row_h)
 
     tbl_element = table._tbl
