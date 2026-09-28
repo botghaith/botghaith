@@ -23,7 +23,6 @@ from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_
 from services.field_context import use_detected_field
 from services.translator import (
     translate_text,
-    translate_line_fully,
     resolve_direction,
     set_file_translation_mode,
     is_translator_ready,
@@ -53,6 +52,7 @@ _WORD_BATCH_SIZE = 40
 
 def _clear_word_cache():
     _word_cache.clear()
+    _align_cache.clear()
 
 def _token_core(token: str) -> str:
     return re.sub(r"^[^\w\u0600-\u06FF]+|[^\w\u0600-\u06FF]+$", "", (token or "").strip())
@@ -115,14 +115,77 @@ def group_tokens(tokens: list[str], direction: str) -> list[list[str]]:
                 groups.append(tokens[i:end])
                 i = end
                 continue
-        groups.append([tokens[i]])
-        i += 1
+        if not key or key in stop or not WORD_CHAR_RE.search(tokens[i]):
+            groups.append([tokens[i]])
+            i += 1
+            continue
+        end = i + 1
+        content = 1
+        while end < n and content < 3:
+            nxt = _glue_key(tokens[end])
+            if not nxt or nxt in glue or nxt in stop or not WORD_CHAR_RE.search(tokens[end]):
+                break
+            content += 1
+            end += 1
+        groups.append(tokens[i:end])
+        i = end
     return groups
 
 
 def _echoes_source(translation: str, tokens: list[str]) -> bool:
     src = " ".join(_token_core(token) for token in tokens if _token_core(token))
     return _same_token(translation, src)
+
+
+_align_cache: dict[tuple[str, str], list[str] | None] = {}
+_AR_WORD = re.compile(r"[\u0600-\u06FF]{2,}")
+_EN_WORD = re.compile(r"[A-Za-z]{2,}(?:-[A-Za-z0-9]+)*")
+
+
+def _target_tokens(text: str, direction: str) -> list[str]:
+    pattern = _AR_WORD if direction == "en_ar" else _EN_WORD
+    return pattern.findall(text or "")
+
+
+def _aligned_cores(cores: list[str], direction: str) -> list[str] | None:
+    """ترجمة السطر مرة واحدة. إذا عدد الكلمات طابق، كل كلمة تاخذ معناها من السياق."""
+    cleaned = [core for core in cores if core]
+    if len(cleaned) < 2:
+        return None
+    key = (direction, " ".join(cleaned))
+    if key in _align_cache:
+        return _align_cache[key]
+    mapped: list[str] | None = None
+    try:
+        translated = translate_text(key[1], direction)
+        targets = _target_tokens(translated, direction)
+        if len(targets) == len(cleaned):
+            mapped = targets
+    except Exception as exc:
+        logger.warning("Line alignment failed: %s", exc)
+    _align_cache[key] = mapped
+    return mapped
+
+
+def _translations_for_groups(tokens: list[str], direction: str) -> list[str]:
+    groups = group_tokens(tokens, direction)
+    cores = [_token_core(token) for token in tokens if WORD_CHAR_RE.search(token)]
+    aligned = _aligned_cores(cores, direction)
+    cursor = 0
+    translations: list[str] = []
+    for group in groups:
+        words = [token for token in group if WORD_CHAR_RE.search(token)]
+        if not words:
+            translations.append("")
+            continue
+        piece = ""
+        if aligned is not None and cursor + len(words) <= len(aligned):
+            piece = " ".join(aligned[cursor:cursor + len(words)]).strip()
+        if not piece:
+            piece = translate_token_group(words, direction)
+        translations.append(piece)
+        cursor += len(words)
+    return translations
 
 
 def translate_token_group(tokens: list[str], direction: str) -> str:
@@ -581,8 +644,8 @@ def _translate_image_online_full(
     return result
 
 
-OVERLAY_TR_SIZE = 6
-OVERLAY_TR_SIZE_PDF = 7
+OVERLAY_TR_SIZE = 7.5
+OVERLAY_TR_SIZE_PDF = 8.5
 OVERLAY_WORD_SIZE = 11
 OVERLAY_LINE_SPACING = 0.68
 
@@ -689,8 +752,8 @@ def _pdf_insert_translation_above(page, x0, y0, x1, y1, text: str, fontfile: str
     word_h = max(y1 - y0, 3)
     scale = font_scale()
     requested = scaled_pt(OVERLAY_TR_SIZE_PDF)
-    fs = min(requested, word_h * 0.42 * scale)
-    fs = max(fs, scaled_pt(5.2, 3.8))
+    fs = min(requested, word_h * 0.52 * scale)
+    fs = max(fs, scaled_pt(6.0, 4.2))
 
     font_kwargs = {}
     if fontfile:
@@ -704,15 +767,15 @@ def _pdf_insert_translation_above(page, x0, y0, x1, y1, text: str, fontfile: str
             return len(display) * size * 0.45
 
     tw = _text_width(fs)
-    max_w = word_w * (1.08 + 0.22 * max(0.0, scale - 1.0))
-    min_fs = scaled_pt(4.2, 3.4)
+    max_w = word_w * (1.22 + 0.22 * max(0.0, scale - 1.0))
+    min_fs = scaled_pt(4.8, 3.6)
     while tw > max_w and fs > min_fs:
         fs -= 0.15
         tw = _text_width(fs)
 
     x = max(x0, x1 - tw) if rtl else x0
-    # أقرب للكلمة، مع حد حتى ما تنزل على جسم الكلمة أو السطر اللي فوقها
-    y = y0 + min(fs * 0.46, word_h * 0.20)
+    # فوق الكتابة بمسافة صغيرة، مو نازلة على جسم الكلمة
+    y = y0 + min(fs * 0.28, word_h * 0.08) - 2.4
 
     try:
         page.insert_text((x, y), display, fontsize=fs, color=translation_color_rgb(), **font_kwargs)
@@ -729,9 +792,12 @@ def _add_overlay_runs_at_index(
 ) -> int:
     direction = resolve_direction(text, direction)
     tokens = WORD_TOKEN_RE.findall(text)
-    for group in group_tokens(tokens, direction):
+    groups = group_tokens(tokens, direction)
+    translations = _translations_for_groups(tokens, direction)
+    for group, tr in zip(groups, translations):
         words = [token for token in group if WORD_CHAR_RE.search(token)]
-        tr = translate_token_group(words, direction) if words else ""
+        if not words:
+            tr = ""
         if tr.strip():
             r = OxmlElement("w:r")
             parent.insert(insert_idx, r)
@@ -742,7 +808,7 @@ def _add_overlay_runs_at_index(
             set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
             tr_run.font.superscript = True
             tr_run.font.size = Pt(tr_sz)
-            _nudge_run_down(tr_run, 1.5)
+            _nudge_run_down(tr_run, 0)
             _colorize_overlay_run(tr_run)
         for token in group:
             if not WORD_CHAR_RE.search(token):
@@ -792,6 +858,7 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
     if not tokens:
         return
     groups = group_tokens(tokens, direction)
+    translations = _translations_for_groups(tokens, direction)
 
     table = doc.add_table(rows=1, cols=len(groups))
     _remove_table_borders(table)
@@ -809,12 +876,12 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         words = [token for token in group if WORD_CHAR_RE.search(token)]
-        tr = translate_token_group(words, direction) if words else ""
+        tr = translations[col] if words else ""
         if tr.strip():
             tr_run = p.add_run(tr)
             tr_sz = scaled_pt(OVERLAY_TR_SIZE)
             set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
-            _nudge_run_down(tr_run, 2)
+            _nudge_run_down(tr_run, 0.4)
             _colorize_overlay_run(tr_run)
             br_run = p.add_run()
             br_run.add_break()
@@ -822,7 +889,7 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
         w_run = p.add_run(" ".join(group))
         set_run_font(w_run, "Tahoma", OVERLAY_WORD_SIZE)
 
-    row_h = scaled_pt(OVERLAY_TR_SIZE) + OVERLAY_WORD_SIZE
+    row_h = scaled_pt(OVERLAY_TR_SIZE) + OVERLAY_WORD_SIZE + 2
     _set_row_exact_height(table.rows[0], row_h)
 
     tbl_element = table._tbl
@@ -877,13 +944,13 @@ def _grouped_overlay_jobs(jobs: list[tuple], direction: str) -> list[tuple]:
     for line in lines:
         tokens = [job[0] for job in line]
         index = 0
-        for group in group_tokens(tokens, direction):
+        translations = _translations_for_groups(tokens, direction)
+        for group, translation in zip(group_tokens(tokens, direction), translations):
             chunk = line[index:index + len(group)]
             index += len(group)
             words = [token for token in group if WORD_CHAR_RE.search(token)]
             if not words or not chunk:
                 continue
-            translation = translate_token_group(words, direction)
             grouped.append((
                 " ".join(words),
                 min(item[1] for item in chunk),
@@ -930,215 +997,10 @@ def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
     src.close()
 
 
-def _translate_one_line(text: str, direction: str) -> str:
-    """السطر كله وحدة ترجمة واحدة، بدون دمج ولا تقسيم."""
-    raw = " ".join((text or "").split())
-    if not raw or not WORD_CHAR_RE.search(raw):
-        return ""
-    translated = translate_line_fully(raw, direction).strip()
-    if not translated or _same_token(translated, raw):
-        return ""
-    return translated
-
-
-def _coalesce_line_rows(
-    lines: list[tuple[str, float, float, float, float]],
-) -> list[tuple[str, float, float, float, float]]:
-    """أجزاء نفس السطر تصير سطر واحد. السطر اللي تحته يبقى لحاله."""
-    ordered = sorted(lines, key=lambda item: (item[2], item[1]))
-    rows: list[tuple[str, float, float, float, float]] = []
-    for text, x0, y0, x1, y1 in ordered:
-        if rows:
-            prev_text, px0, py0, px1, py1 = rows[-1]
-            same_row = abs(y0 - py0) <= max(2.2, (y1 - y0) * 0.4)
-            if same_row:
-                if x0 < px0:
-                    merged = f"{text} {prev_text}".strip()
-                    nx0, nx1 = x0, max(x1, px1)
-                else:
-                    merged = f"{prev_text} {text}".strip()
-                    nx0, nx1 = px0, max(x1, px1)
-                rows[-1] = (merged, nx0, min(y0, py0), nx1, max(y1, py1))
-                continue
-        rows.append((text, x0, y0, x1, y1))
-    return rows
-
-
-def _iter_pdf_line_blocks(page) -> list[list[tuple[str, float, float, float, float]]]:
-    blocks: list[list[tuple[str, float, float, float, float]]] = []
-    for block in page.get_text("dict").get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        raw: list[tuple[str, float, float, float, float]] = []
-        for line in block.get("lines", []):
-            text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
-            if not text or not WORD_CHAR_RE.search(text):
-                continue
-            x0, y0, x1, y1 = line["bbox"]
-            raw.append((text, x0, y0, x1, y1))
-        rows = _coalesce_line_rows(raw)
-        if rows:
-            blocks.append(rows)
-    return blocks
-
-
-def _line_font_kwargs(fontfile: str | None) -> dict:
-    if not fontfile:
-        return {}
-    return {"fontfile": fontfile, "fontname": "TahomaAr"}
-
-
-def _measure_line(page, text: str, size: float, font_kwargs: dict) -> float:
-    import fitz
-
-    try:
-        return fitz.get_text_length(text, fontsize=size, **font_kwargs)
-    except Exception:
-        return len(text) * size * 0.45
-
-
-def _draw_line_block(page, rows, fontfile: str | None, direction: str):
-    """كل سطر ترجمته فوقه، بنفس حجم الخط وبعرض العمود."""
-    from services.text_shape import has_arabic
-
-    font_kwargs = _line_font_kwargs(fontfile)
-    prepared: list[tuple[str, str] | None] = []
-    for text, _x0, _y0, _x1, _y1 in rows:
-        translation = _translate_one_line(text, direction)
-        if not translation:
-            prepared.append(None)
-            continue
-        rtl = direction == "en_ar" or is_mostly_arabic(translation)
-        display = shape_for_pdf(translation) if has_arabic(translation) else translation
-        prepared.append((display, "rtl" if rtl else "ltr"))
-
-    target = scaled_pt(7.5)
-    floor = scaled_pt(4.8, 4.0)
-    # نفس النزول لكل سطر: أقرب للكلمات وبمسافة ثابتة
-    drop = scaled_pt(2.6)
-    color = translation_color_rgb()
-    for row, item in zip(rows, prepared):
-        _text, x0, y0, x1, y1 = row
-        if not item:
-            continue
-        display, side = item
-        line_w = max(x1 - x0, 18)
-        size = target
-        tw = _measure_line(page, display, size, font_kwargs)
-        while tw > line_w and size > floor:
-            size -= 0.15
-            tw = _measure_line(page, display, size, font_kwargs)
-        baseline = y0 + min(drop, max(1.2, (y1 - y0) * 0.22))
-        if side == "rtl":
-            x = x1 - tw
-            if x < x0:
-                x = x0
-        else:
-            x = x0
-        try:
-            page.insert_text((x, baseline), display, fontsize=size, color=color, **font_kwargs)
-        except Exception:
-            page.insert_text((x, baseline), display, fontsize=size, color=color)
-
-
-def _translate_pdf_sentence_overlay(source: Path, out_path: Path, direction: str):
-    import fitz
-
-    src = fitz.open(str(source))
-    out = fitz.open()
-    fontfile = find_arabic_font()
-    for page_num in range(len(src)):
-        page = src[page_num]
-        new_page = out.new_page(width=page.rect.width, height=page.rect.height)
-        new_page.show_pdf_page(page.rect, src, page_num)
-        for block in _iter_pdf_line_blocks(page):
-            _draw_line_block(new_page, block, fontfile, direction)
-    out.save(str(out_path))
-    out.close()
-    src.close()
-
-
-def _prepend_sentence_paragraph(para, direction: str):
-    """يضيف ترجمة الجملة فوق الفقرة بدون ما يغيّر نصها أو تنسيقها."""
-    from docx.text.paragraph import Paragraph
-
-    lines = [line.strip() for line in para.text.splitlines() if line.strip()]
-    if not lines:
-        return
-    src_fmt = para.paragraph_format
-    for line in reversed(lines):
-        translation = _translate_one_line(line, direction)
-        if not translation:
-            continue
-        new_p = OxmlElement("w:p")
-        para._p.addprevious(new_p)
-        new_para = Paragraph(new_p, para._parent)
-        new_para.paragraph_format.space_before = Pt(0)
-        new_para.paragraph_format.space_after = Pt(0)
-        new_para.paragraph_format.line_spacing = 0.85
-        new_para.paragraph_format.left_indent = src_fmt.left_indent
-        new_para.paragraph_format.right_indent = src_fmt.right_indent
-        rtl = direction == "en_ar" or is_mostly_arabic(translation)
-        set_paragraph_direction(new_para, rtl)
-        new_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT if rtl else WD_ALIGN_PARAGRAPH.LEFT
-        run = new_para.add_run(translation)
-        tr_sz = scaled_pt(8)
-        set_run_font(run, "Tahoma", max(6, int(round(tr_sz))))
-        run.font.size = Pt(tr_sz)
-        _nudge_run_down(run, 2)
-        _colorize_overlay_run(run)
-
-
-def _process_docx_sentences(doc: Document, direction: str):
-    for para in list(doc.paragraphs):
-        if para.text.strip():
-            _prepend_sentence_paragraph(para, direction)
-    for table in list(doc.tables):
-        for row in table.rows:
-            for cell in row.cells:
-                for para in list(cell.paragraphs):
-                    if para.text.strip():
-                        _prepend_sentence_paragraph(para, direction)
-
-
-def _build_sentence_file(
-    source_path: Path, out_dir: Path, stem: str, direction: str, content: str,
-) -> dict[str, Path]:
-    direction = resolve_direction(content, direction)
-    suffix = source_path.suffix.lower()
-
-    if suffix in (".docx", ".doc"):
-        out = out_dir / f"{stem}_5_ترجمة_الجملة.docx"
-        shutil.copy2(source_path, out)
-        doc = Document(out)
-        _process_docx_sentences(doc, direction)
-        doc.save(out)
-        return {"sentence": out}
-
-    if suffix == ".pdf":
-        out = out_dir / f"{stem}_5_ترجمة_الجملة.pdf"
-        _translate_pdf_sentence_overlay(source_path, out, direction)
-        return {"sentence": out}
-
-    out = out_dir / f"{stem}_5_ترجمة_الجملة.txt"
-    blocks: list[str] = []
-    for line in content.splitlines():
-        if not line.strip():
-            blocks.append("")
-            continue
-        translation = _translate_one_line(line, direction)
-        if translation:
-            blocks.append(translation)
-        blocks.append(line)
-    out.write_text("\n".join(blocks), encoding="utf-8-sig")
-    return {"sentence": out}
-
-
 def _build_overlay_file(
     source_path: Path, out_dir: Path, stem: str, direction: str, content: str,
 ) -> dict[str, Path]:
     direction = resolve_direction(content, direction)
-    _prewarm_word_cache_for_text(content, direction)
     suffix = source_path.suffix.lower()
 
     if suffix in (".docx", ".doc"):
@@ -1388,14 +1250,6 @@ def build_full_file_overlay(data: dict) -> Path:
         )["overlay"]
 
 
-def build_full_file_sentence(data: dict) -> Path:
-    set_file_translation_mode(True)
-    with use_detected_field(data.get("content") or ""):
-        return _build_sentence_file(
-            data["source_path"], data["output_dir"], data["stem"],
-            data["direction"], data["content"],
-        )["sentence"]
-
 
 def build_full_image_literal(data: dict) -> Path:
     set_file_translation_mode(True)
@@ -1429,15 +1283,6 @@ def build_full_image_overlay(data: dict) -> Path:
         )
     return path
 
-
-def build_full_image_sentence(data: dict) -> Path:
-    set_file_translation_mode(True)
-    path = data["output_dir"] / f"{data['stem']}_5_ترجمة_الجملة.pdf"
-    with use_detected_field(data.get("content") or ""):
-        _translate_image_sentence(
-            data["image_path"], data["layout"], path, data["direction"], data["content"],
-        )
-    return path
 
 
 def _translate_pdf(source: Path, out_dir: Path, stem: str, direction: str) -> dict[str, Path]:
@@ -1508,51 +1353,12 @@ def _translate_image_structured(
     doc.close()
 
 
-def _lines_from_word_jobs(jobs: list[tuple]) -> list[tuple[str, float, float, float, float]]:
-    grouped: list[tuple[str, float, float, float, float]] = []
-    for token, x0, y0, x1, y1, line_text in jobs:
-        text = (line_text or token or "").strip()
-        if not text:
-            continue
-        if grouped:
-            prev_text, px0, py0, px1, py1 = grouped[-1]
-            same = abs(py0 - y0) < max(4.0, (py1 - py0) * 0.7) and prev_text == text
-            if same:
-                grouped[-1] = (text, min(px0, x0), min(py0, y0), max(px1, x1), max(py1, y1))
-                continue
-        grouped.append((text, x0, y0, x1, y1))
-    return grouped
-
-
-def _translate_image_sentence(
-    image_path: Path, layout: dict, out_path: Path, direction: str, content: str,
-):
-    import fitz
-
-    direction = resolve_direction(content, direction)
-    fontfile = find_arabic_font()
-    doc = fitz.open()
-    page = doc.new_page(width=layout["width"], height=layout["height"])
-    page.insert_image(page.rect, filename=str(image_path))
-    jobs = [
-        (token, x0, y0, x1, y1, line_text)
-        for token, x0, y0, x1, y1, line_text in layout.get("words", [])
-        if WORD_CHAR_RE.search(token) or WORD_CHAR_RE.search(line_text or "")
-    ]
-    lines = _coalesce_line_rows(_lines_from_word_jobs(jobs))
-    if lines:
-        _draw_line_block(page, lines, fontfile, direction)
-    doc.save(str(out_path))
-    doc.close()
-
-
 def _translate_image_overlay(
     image_path: Path, layout: dict, out_path: Path, direction: str, content: str,
 ):
     import fitz
 
     direction = resolve_direction(content, direction)
-    _prewarm_word_cache_for_text(content, direction)
     fontfile = find_arabic_font()
     doc = fitz.open()
     page = doc.new_page(width=layout["width"], height=layout["height"])
