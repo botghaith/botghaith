@@ -75,17 +75,14 @@ def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
     logger.info("Prewarming word cache: %d unique tokens", len(unique))
     for i in range(0, len(unique), _WORD_BATCH_SIZE):
         chunk = unique[i:i + _WORD_BATCH_SIZE]
-        payload = "\n".join(f"{idx + 1}. {w}" for idx, w in enumerate(chunk))
+        payload = "\n".join(chunk)
         try:
             translated = translate_text(payload, direction)
             lines = [ln.strip() for ln in translated.splitlines() if ln.strip()]
-            parsed: list[str] = []
-            for ln in lines:
-                m = re.match(r"^\d+\.\s*(.+)$", ln)
-                parsed.append(m.group(1).strip() if m else ln)
-            if len(parsed) == len(chunk):
-                for w, tw in zip(chunk, parsed):
-                    _word_cache[(w.lower(), direction)] = tw
+            if len(lines) == len(chunk):
+                for w, tw in zip(chunk, lines):
+                    tw = re.sub(r"^[\(\[]?\d{1,3}[\)\].:\-]\s*", "", tw).strip()
+                    _word_cache[(w.lower(), direction)] = tw or w
                 continue
         except Exception as e:
             logger.warning("Batch word prewarm failed: %s", e)

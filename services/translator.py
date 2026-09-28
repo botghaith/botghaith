@@ -320,24 +320,40 @@ def _leftover_words(source: str, translated: str, direction: str) -> list[str]:
     return found
 
 
-def _parse_numbered_lines(text: str, expected: int) -> list[str] | None:
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    parsed: list[str] = []
-    for line in lines:
-        match = re.match(r"^\d+\.\s*(.+)$", line)
-        parsed.append(match.group(1).strip() if match else line)
-    if len(parsed) != expected:
-        return None
-    return parsed
+_ADDED_MARKER = re.compile(
+    r"^(?:[\(\[]?\d{1,3}[\)\].:\-]\s*|مصطلح علمي\s*[:：]\s*|scientific term\s*[:：]\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _line_has_list_index(line: str) -> bool:
+    return bool(re.match(r"^[\(\[]?\d{1,3}[\)\].:\-]", (line or "").strip()))
+
+
+def _strip_added_markers(source: str, translated: str) -> str:
+    """يشيل رقم القائمة أو عبارة «مصطلح علمي» إذا المحرك أضافها والنص الأصلي ما بيها."""
+    out = (translated or "").strip()
+    if not out:
+        return out
+    src_lines = (source or "").splitlines() or [""]
+    out_lines = out.splitlines()
+    if len(src_lines) != len(out_lines):
+        if _line_has_list_index(src_lines[0]):
+            return out
+        cleaned = _ADDED_MARKER.sub("", out).strip()
+        return cleaned or out
+    cleaned_lines: list[str] = []
+    for src_line, line in zip(src_lines, out_lines):
+        if _line_has_list_index(src_line):
+            cleaned_lines.append(line)
+            continue
+        stripped = _ADDED_MARKER.sub("", line).strip()
+        cleaned_lines.append(stripped if stripped else line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def _clean_term_translation(text: str, original: str) -> str | None:
-    cleaned = (text or "").strip()
-    cleaned = re.sub(r"^\d+\.\s*", "", cleaned).strip(" .،")
-    if ":" in cleaned or "：" in cleaned:
-        tail = re.split(r"[:：]", cleaned, maxsplit=1)[-1].strip(" .،")
-        if tail and not _texts_match(tail, original):
-            cleaned = tail
+    cleaned = _strip_added_markers(original, (text or "").strip()).strip(" .،")
     if not cleaned or _texts_match(cleaned, original):
         return None
     if len(cleaned.split()) > 8:
@@ -345,51 +361,36 @@ def _clean_term_translation(text: str, original: str) -> str | None:
     return cleaned
 
 
-def _batch_translate_words(words: list[str], direction: str, *, carrier: bool) -> dict[str, str]:
-    """ترجمة الكلمات التي نسخت كما هي. لا يمر عبر translate_text حتى لا تتكرر المحاولة."""
+def _batch_translate_words(words: list[str], direction: str) -> dict[str, str]:
+    """ترجمة الكلمات التي نسخت كما هي، بدون أرقام أو عناوين إضافية."""
     resolved: dict[str, str] = {}
     pending: list[str] = []
     for word in words:
         hit = lookup_preserving(word, direction)
         if hit and not _texts_match(hit, word):
-            resolved[word.casefold()] = hit.strip(" .،")
+            resolved[word.casefold()] = _strip_added_markers(word, hit)
         else:
             pending.append(word)
 
-    step = 25
+    step = 20
     for start in range(0, len(pending), step):
         chunk = pending[start:start + step]
-        if carrier:
-            rendered = [
-                f"scientific term: {word}" if direction == "en_ar" else f"مصطلح علمي: {word}"
-                for word in chunk
-            ]
-        else:
-            rendered = chunk
-        payload = "\n".join(f"{index}. {item}" for index, item in enumerate(rendered, 1))
         parsed: list[str] | None = None
         try:
-            raw = _online_translate(payload, direction)
-            parsed = _parse_numbered_lines(raw, len(chunk))
+            raw = _online_translate("\n".join(chunk), direction)
+            lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+            if len(lines) == len(chunk):
+                parsed = lines
         except Exception as error:
             logger.warning("Leftover word batch failed: %s", error)
         if parsed is None:
             for word in chunk:
-                probe = (
-                    f"scientific term: {word}" if carrier or direction == "en_ar" else f"مصطلح علمي: {word}"
-                )
                 try:
-                    one = _online_translate(probe if carrier else word, direction)
+                    one = _online_translate(word, direction)
                 except Exception as error:
                     logger.debug("Single leftover word failed (%s): %s", word, error)
                     continue
                 cleaned = _clean_term_translation(one, word)
-                if not cleaned and not carrier:
-                    try:
-                        one = _online_translate(probe, direction)
-                    except Exception:
-                        one = ""
-                    cleaned = _clean_term_translation(one, word)
                 if cleaned:
                     resolved[word.casefold()] = cleaned
             continue
@@ -405,8 +406,7 @@ def fill_copied_words(source: str, translated: str, direction: str) -> str:
     leftovers = _leftover_words(source, translated, direction)
     if not leftovers:
         return translated
-    whole_copied = _texts_match(translated, source)
-    mapping = _batch_translate_words(leftovers, direction, carrier=whole_copied)
+    mapping = _batch_translate_words(leftovers, direction)
     if not mapping:
         return translated
     for word in leftovers:
@@ -428,7 +428,7 @@ def _should_rescue(text: str, direction: str) -> bool:
 
 
 def _rescue_term(text: str, direction: str) -> str | None:
-    """محاولة أخيرة لمصطلح قصير رجع كما هو، بصيغة سؤال علمي."""
+    """محاولة أخيرة لمصطلح قصير رجع كما هو، بدون إضافة أرقام أو عناوين."""
     raw = (text or "").strip()
     match = re.match(r"^([^\w\u0600-\u06FF]*)(.*?)([^\w\u0600-\u06FF]*)$", raw, re.DOTALL)
     if not match:
@@ -436,21 +436,15 @@ def _rescue_term(text: str, direction: str) -> str | None:
     prefix, core, suffix = match.group(1), match.group(2).strip(), match.group(3)
     if len(core) < 2:
         return None
-    probe = f"scientific term: {core}" if direction == "en_ar" else f"مصطلح علمي: {core}"
     try:
-        out = _google_translate(probe, direction)
+        out = _google_translate(core, direction)
     except Exception as e:
         logger.debug("Scientific term rescue failed: %s", e)
         return None
-    if not out:
+    cleaned = _clean_term_translation(out or "", core)
+    if not cleaned:
         return None
-    parts = re.split(r"[:：]", out, maxsplit=1)
-    if len(parts) < 2:
-        return None
-    tail = parts[1].strip().strip(" .،")
-    if not tail or _texts_match(tail, core) or _texts_match(tail, raw):
-        return None
-    return f"{prefix}{tail}{suffix}"
+    return f"{prefix}{cleaned}{suffix}"
 
 
 def _dispatch_translation(prepared: str, original: str, direction: str) -> str:
@@ -528,7 +522,7 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
         rescued = _rescue_term(text, direction)
         if rescued:
             translated = repair_copied(rescued, direction)
-    return translated
+    return _strip_added_markers(text, translated)
 
 
 def translate_units(text: str, direction: str = "en_ar") -> list[tuple[str, str]]:
