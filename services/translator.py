@@ -437,6 +437,81 @@ def _dispatch_translation(prepared: str, original: str, direction: str) -> str:
     raise RuntimeError(f"تعذرت الترجمة: {detail}")
 
 
+_EN_PREP_AR = {
+    "of": "من",
+    "in": "في",
+    "on": "على",
+    "at": "في",
+    "to": "إلى",
+    "for": "ل",
+    "from": "من",
+    "with": "مع",
+    "by": "ب",
+    "into": "إلى",
+    "over": "فوق",
+    "under": "تحت",
+    "about": "عن",
+    "between": "بين",
+    "through": "خلال",
+    "during": "خلال",
+    "without": "بدون",
+    "within": "ضمن",
+    "upon": "على",
+    "per": "لكل",
+}
+_CLOSED_PHRASE_RE = re.compile(
+    r"^(?:(?P<prep>of|in|on|at|to|for|from|with|by|into|over|under|about|between|through|during|without|within|upon|per)\s+)?"
+    r"(?:(?P<article>the|a|an)\s+)?"
+    r"(?P<head>[A-Za-z][\w'-]*)$",
+    re.IGNORECASE,
+)
+
+
+def _arabic_definite(phrase: str) -> str:
+    parts = (phrase or "").split()
+    if not parts:
+        return phrase
+    head = parts[0]
+    if head.startswith(("ال", "لل", "بال")):
+        return phrase
+    parts[0] = "ال" + head
+    return " ".join(parts)
+
+
+def _bind_arabic_prep(prep: str, phrase: str) -> str:
+    # لِ + ال = لل (تسقط الألف). بِ + ال = بال (تبقى الألف).
+    if prep == "ل" and phrase.startswith("ال"):
+        return "ل" + phrase[1:]
+    if prep == "ب" and phrase.startswith("ال"):
+        return "ب" + phrase
+    return f"{prep} {phrase}".strip()
+
+
+def _compose_closed_phrase(text: str, direction: str) -> str | None:
+    """the flower → الزهرة، مو ال + زهرة كل وحدة لحال."""
+    if direction != "en_ar":
+        return None
+    raw = re.sub(r"\s+", " ", (text or "")).strip(" .،!?؟")
+    match = _CLOSED_PHRASE_RE.fullmatch(raw)
+    if not match or not match.group("head"):
+        return None
+    prep = (match.group("prep") or "").lower()
+    article = (match.group("article") or "").lower()
+    head = match.group("head")
+    if not prep and not article:
+        return None
+    if head.casefold() in _EN_PREP_AR or head.casefold() in {"the", "a", "an"}:
+        return None
+    noun = translate_text(head, direction).strip()
+    if not ARABIC_RE.search(noun):
+        return None
+    if article == "the":
+        noun = _arabic_definite(noun)
+    if prep:
+        noun = _bind_arabic_prep(_EN_PREP_AR[prep], noun)
+    return noun
+
+
 def translate_text(text: str, direction: str = "en_ar") -> str:
     text = (text or "").strip()
     if not text:
@@ -446,6 +521,10 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
     exact = lookup_preserving(text, direction)
     if exact is not None:
         return exact
+
+    composed = _compose_closed_phrase(text, direction)
+    if composed:
+        return composed
 
     prepared = apply_known_terms(text, direction)
     translated = _dispatch_translation(prepared, text, direction)

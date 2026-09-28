@@ -57,6 +57,72 @@ def _same_token(left: str, right: str) -> bool:
     return bool(a) and a == b
 
 
+# أدوات تلتصق بالكلمة اللي بعدها وتترجم وياها كعبارة واحدة.
+_EN_GLUE = {
+    "the", "a", "an", "this", "that", "these", "those",
+    "my", "your", "his", "her", "its", "our", "their",
+    "some", "any", "each", "every", "no",
+    "of", "in", "on", "at", "to", "for", "from", "with", "by",
+    "as", "into", "onto", "over", "under", "about", "between",
+    "through", "during", "without", "within", "upon", "per",
+}
+_EN_STOP = {
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "have", "has", "had", "do", "does", "did",
+    "will", "would", "can", "could", "may", "might", "shall", "should", "must",
+    "and", "or", "but", "if", "then", "than", "not", "so", "because", "while",
+    "when", "where", "who", "which", "what", "how", "why",
+}
+_AR_GLUE = {
+    "في", "من", "على", "إلى", "الى", "عن", "مع",
+    "هذا", "هذه", "ذلك", "تلك", "هؤلاء",
+}
+
+
+def _glue_key(token: str) -> str:
+    return _token_core(token).casefold()
+
+
+def group_tokens(tokens: list[str], direction: str) -> list[list[str]]:
+    """the flower تبقى عبارة واحدة، مو كلمتين منفصلتين."""
+    glue = _EN_GLUE if direction != "ar_en" else _AR_GLUE
+    stop = _EN_STOP if direction != "ar_en" else set()
+    groups: list[list[str]] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        key = _glue_key(tokens[i])
+        if key in glue:
+            j = i
+            while j < n and _glue_key(tokens[j]) in glue:
+                j += 1
+            end = j
+            content = 0
+            while end < n and content < 3:
+                nxt = _glue_key(tokens[end])
+                if not nxt or nxt in glue or nxt in stop:
+                    break
+                content += 1
+                end += 1
+            if content:
+                groups.append(tokens[i:end])
+                i = end
+                continue
+        groups.append([tokens[i]])
+        i += 1
+    return groups
+
+
+def translate_token_group(tokens: list[str], direction: str) -> str:
+    words = [token for token in tokens if WORD_CHAR_RE.search(token)]
+    if not words:
+        return ""
+    if len(words) == 1:
+        return translate_word(words[0], direction)
+    phrase = " ".join(_token_core(token) for token in words if _token_core(token))
+    return translate_text(phrase, direction)
+
+
 def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
     """ترجمة الكلمات الفريدة دفعة واحدة — أسرع بكثير من كلمة/طلب."""
     direction = resolve_direction(text, direction)
@@ -192,10 +258,9 @@ def build_literal_sections(text: str, direction: str) -> list[tuple[str, list[tu
 
     for idx, unit in enumerate(_extract_logical_units(text), 1):
         pairs: list[tuple[str, str]] = []
-        for token in WORD_TOKEN_RE.findall(unit):
-            if not WORD_CHAR_RE.search(token):
-                continue
-            pairs.append((token, translate_word_in_context(token, unit, direction)))
+        words = [token for token in WORD_TOKEN_RE.findall(unit) if WORD_CHAR_RE.search(token)]
+        for group in group_tokens(words, direction):
+            pairs.append((" ".join(group), translate_token_group(group, direction)))
         if pairs:
             sections.append((f"الفقرة {idx}", pairs))
 
@@ -634,9 +699,11 @@ def _add_overlay_runs_at_index(
     para, parent, insert_idx: int, text: str, direction: str
 ) -> int:
     direction = resolve_direction(text, direction)
-    for token in WORD_TOKEN_RE.findall(text):
-        if WORD_CHAR_RE.search(token):
-            tr = translate_word_in_context(token, text, direction)
+    tokens = WORD_TOKEN_RE.findall(text)
+    for group in group_tokens(tokens, direction):
+        words = [token for token in group if WORD_CHAR_RE.search(token)]
+        if words:
+            tr = translate_token_group(words, direction)
             r = OxmlElement("w:r")
             parent.insert(insert_idx, r)
             insert_idx += 1
@@ -647,6 +714,13 @@ def _add_overlay_runs_at_index(
             tr_run.font.superscript = True
             tr_run.font.size = Pt(tr_sz)
             _colorize_overlay_run(tr_run)
+        for token in group:
+            if not WORD_CHAR_RE.search(token):
+                r = OxmlElement("w:r")
+                parent.insert(insert_idx, r)
+                insert_idx += 1
+                Run(r, para).text = token
+                continue
             r = OxmlElement("w:r")
             parent.insert(insert_idx, r)
             insert_idx += 1
@@ -658,11 +732,6 @@ def _add_overlay_runs_at_index(
                 parent.insert(insert_idx, sp)
                 insert_idx += 1
                 Run(sp, para).text = " "
-        else:
-            r = OxmlElement("w:r")
-            parent.insert(insert_idx, r)
-            insert_idx += 1
-            Run(r, para).text = token
     return insert_idx
 
 
@@ -692,12 +761,13 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
     tokens = WORD_TOKEN_RE.findall(text)
     if not tokens:
         return
+    groups = group_tokens(tokens, direction)
 
-    table = doc.add_table(rows=1, cols=len(tokens))
+    table = doc.add_table(rows=1, cols=len(groups))
     _remove_table_borders(table)
     _set_table_tight_spacing(table)
 
-    for col, token in enumerate(tokens):
+    for col, group in enumerate(groups):
         cell = table.rows[0].cells[col]
         _set_cell_tight_margin(cell)
         _set_cell_valign(cell, "center")
@@ -708,8 +778,9 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
         p.paragraph_format.line_spacing = OVERLAY_LINE_SPACING
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        if WORD_CHAR_RE.search(token):
-            tr = translate_word_in_context(token, text, direction)
+        words = [token for token in group if WORD_CHAR_RE.search(token)]
+        if words:
+            tr = translate_token_group(words, direction)
             tr_run = p.add_run(tr)
             tr_sz = scaled_pt(OVERLAY_TR_SIZE)
             set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
@@ -717,7 +788,7 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
             br_run = p.add_run()
             br_run.add_break()
 
-        w_run = p.add_run(token)
+        w_run = p.add_run(" ".join(group))
         set_run_font(w_run, "Tahoma", OVERLAY_WORD_SIZE)
 
     row_h = scaled_pt(OVERLAY_TR_SIZE) + OVERLAY_WORD_SIZE + 1
@@ -758,6 +829,41 @@ def _process_docx_overlay(doc: Document, direction: str):
                     _apply_overlay_paragraph(para, direction, doc)
 
 
+def _grouped_overlay_jobs(jobs: list[tuple], direction: str) -> list[tuple]:
+    """يجمع the flower في مربع واحد حتى الترجمة تطلع مرة واحدة."""
+    lines: list[list[tuple]] = []
+    for job in jobs:
+        _token, _x0, y0, _x1, y1, line_text = job
+        if lines:
+            prev = lines[-1][-1]
+            same_line = abs(prev[2] - y0) < max(4.0, (prev[4] - prev[2]) * 0.7)
+            if same_line and prev[5] == line_text:
+                lines[-1].append(job)
+                continue
+        lines.append([job])
+
+    grouped: list[tuple] = []
+    for line in lines:
+        tokens = [job[0] for job in line]
+        index = 0
+        for group in group_tokens(tokens, direction):
+            chunk = line[index:index + len(group)]
+            index += len(group)
+            words = [token for token in group if WORD_CHAR_RE.search(token)]
+            if not words or not chunk:
+                continue
+            translation = translate_token_group(words, direction)
+            grouped.append((
+                " ".join(words),
+                min(item[1] for item in chunk),
+                min(item[2] for item in chunk),
+                max(item[3] for item in chunk),
+                max(item[4] for item in chunk),
+                translation,
+            ))
+    return grouped
+
+
 def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
     import fitz
 
@@ -782,8 +888,7 @@ def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
         if not word_jobs:
             continue
 
-        for token, x0, y0, x1, y1, line_text in word_jobs:
-            tr = translate_word_in_context(token, line_text, direction)
+        for token, x0, y0, x1, y1, tr in _grouped_overlay_jobs(word_jobs, direction):
             rtl = direction == "en_ar" or is_mostly_arabic(tr)
             _pdf_insert_translation_above(new_page, x0, y0, x1, y1, tr, fontfile, rtl)
 
@@ -1157,10 +1262,12 @@ def _translate_image_overlay(
     page = doc.new_page(width=layout["width"], height=layout["height"])
     page.insert_image(page.rect, filename=str(image_path))
 
-    for token, x0, y0, x1, y1, line_text in layout.get("words", []):
-        if not WORD_CHAR_RE.search(token):
-            continue
-        tr = translate_word_in_context(token, line_text, direction)
+    words = [
+        (token, x0, y0, x1, y1, line_text)
+        for token, x0, y0, x1, y1, line_text in layout.get("words", [])
+        if WORD_CHAR_RE.search(token)
+    ]
+    for token, x0, y0, x1, y1, tr in _grouped_overlay_jobs(words, direction):
         rtl = direction == "en_ar" or is_mostly_arabic(tr)
         _pdf_insert_translation_above(page, x0, y0, x1, y1, tr, fontfile, rtl)
 
