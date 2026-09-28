@@ -606,6 +606,53 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
     return translated
 
 
+def _fill_line_gaps(source: str, translated: str, direction: str) -> str:
+    """أي كلمة بقيت بلغة المصدر تُترجم حتى ما ينقص السطر."""
+    leftovers = _leftover_words(source, translated, direction)
+    for word in leftovers[:16]:
+        try:
+            hit = _online_translate(word, direction).strip()
+        except Exception:
+            continue
+        hit = _strip_added_markers(word, hit)
+        if not hit or _texts_match(hit, word):
+            continue
+        pattern = re.compile(
+            rf"(?<![\w\u0600-\u06FF]){re.escape(word)}(?![\w\u0600-\u06FF])",
+            re.IGNORECASE,
+        )
+        translated = pattern.sub(hit, translated)
+    return translated
+
+
+def translate_line_fully(text: str, direction: str = "en_ar") -> str:
+    """ترجمة السطر كله مرة واحدة، وكل كلمة داخله تطلع مترجمة."""
+    raw = " ".join((text or "").split())
+    if not raw:
+        return ""
+    direction = resolve_direction(raw, direction)
+    exact = lookup_preserving(raw, direction)
+    if exact is not None:
+        return exact
+
+    prepared = apply_known_terms(raw, direction)
+    prepared = apply_field_terms(prepared, direction)
+    try:
+        translated = _online_translate(prepared, direction)
+    except Exception as exc:
+        logger.warning("Full line translation failed, using the normal engine: %s", exc)
+        return translate_text(raw, direction)
+
+    translated = repair_copied(translated, direction)
+    translated = apply_field_terms(translated, direction)
+    translated = fill_copied_words(raw, translated, direction)
+    translated = _fill_line_gaps(raw, translated, direction)
+    translated = _strip_added_markers(raw, translated)
+    if direction == "en_ar":
+        translated = _drop_copied_of(translated)
+    return translated.strip()
+
+
 def translate_units(text: str, direction: str = "en_ar") -> list[tuple[str, str]]:
     """ترجمة وحدة بوحدة: [(أصلي, مترجم), ...]"""
     direction = resolve_direction(text, direction)

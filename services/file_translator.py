@@ -23,6 +23,7 @@ from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_
 from services.field_context import use_detected_field
 from services.translator import (
     translate_text,
+    translate_line_fully,
     resolve_direction,
     set_file_translation_mode,
     is_translator_ready,
@@ -934,7 +935,7 @@ def _translate_one_line(text: str, direction: str) -> str:
     raw = " ".join((text or "").split())
     if not raw or not WORD_CHAR_RE.search(raw):
         return ""
-    translated = translate_text(raw, direction).strip()
+    translated = translate_line_fully(raw, direction).strip()
     if not translated or _same_token(translated, raw):
         return ""
     return translated
@@ -1046,9 +1047,15 @@ def _draw_line_block(page, rows, fontfile: str | None, direction: str):
         if baseline > y0 - 0.35:
             baseline = y0 - 0.35
         tw = _measure_line(page, display, size, font_kwargs)
-        x = right - tw if side == "rtl" else left
+        while tw > width and size > 3.2:
+            size -= 0.15
+            tw = _measure_line(page, display, size, font_kwargs)
         if side == "rtl":
-            x = max(left, min(x, right - 2))
+            x = right - tw
+            if x < left:
+                x = left
+        else:
+            x = left
         try:
             page.insert_text((x, baseline), display, fontsize=size, color=color, **font_kwargs)
         except Exception:
