@@ -109,7 +109,7 @@ def resolve_direction(text: str, direction: str) -> str:
 
 
 def direction_label(direction: str) -> str:
-    return "عربي → إنجليزي" if direction == "ar_en" else "إنجليزي → عربي"
+    return "إنجليزي → عربي" if direction == "ar_en" else "عربي → إنجليزي"
 
 
 def _chunk_text(text: str, size: int = CHUNK_SIZE) -> list[str]:

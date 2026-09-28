@@ -42,8 +42,8 @@ def translation_menu() -> ReplyKeyboardMarkup:
 def translation_direction_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("عربي → إنجليزي", callback_data="tr_dir_ar_en"),
-            InlineKeyboardButton("إنجليزي → عربي", callback_data="tr_dir_en_ar"),
+            InlineKeyboardButton("إنجليزي → عربي", callback_data="tr_dir_ar_en"),
+            InlineKeyboardButton("عربي → إنجليزي", callback_data="tr_dir_en_ar"),
         ],
         [InlineKeyboardButton("🔄 اكتشاف تلقائي", callback_data="tr_dir_auto")],
     ])
@@ -52,7 +52,7 @@ def translation_direction_menu() -> InlineKeyboardMarkup:
 def translation_direction_reply_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["عربي → إنجليزي", "إنجليزي → عربي"],
+            ["إنجليزي → عربي", "عربي → إنجليزي"],
             ["🔄 اكتشاف تلقائي", "🔙 القائمة الرئيسية"],
         ],
         resize_keyboard=True,
@@ -73,8 +73,8 @@ def translation_color_keyboard() -> InlineKeyboardMarkup:
 
 
 _DIRECTION_FROM_TEXT = {
-    "عربي → إنجليزي": "ar_en",
-    "إنجليزي → عربي": "en_ar",
+    "إنجليزي → عربي": "ar_en",
+    "عربي → إنجليزي": "en_ar",
     "🔄 اكتشاف تلقائي": "auto",
 }
 
