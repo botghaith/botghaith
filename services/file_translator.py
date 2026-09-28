@@ -1001,9 +1001,6 @@ def _draw_line_block(page, rows, fontfile: str | None, direction: str):
     """كل سطر ترجمته فوقه، بنفس حجم الخط وبعرض العمود."""
     from services.text_shape import has_arabic
 
-    left = min(row[1] for row in rows)
-    right = max(row[3] for row in rows)
-    width = max(right - left, 16)
     font_kwargs = _line_font_kwargs(fontfile)
     prepared: list[tuple[str, str] | None] = []
     for text, _x0, _y0, _x1, _y1 in rows:
@@ -1015,52 +1012,33 @@ def _draw_line_block(page, rows, fontfile: str | None, direction: str):
         display = shape_for_pdf(translation) if has_arabic(translation) else translation
         prepared.append((display, "rtl" if rtl else "ltr"))
 
-    target = scaled_pt(8.0)
-    floor = scaled_pt(5.0, 4.2)
-    shared = target
-    for item in prepared:
-        if not item:
-            continue
-        display, _side = item
-        size = shared
-        while size > floor and _measure_line(page, display, size, font_kwargs) > width:
-            size -= 0.2
-        shared = min(shared, size)
-
-    prev_bottom = None
+    target = scaled_pt(7.5)
+    floor = scaled_pt(4.8, 4.0)
+    # نفس النزول لكل سطر: أقرب للكلمات وبمسافة ثابتة
+    drop = scaled_pt(2.6)
     color = translation_color_rgb()
     for row, item in zip(rows, prepared):
-        _text, _x0, y0, _x1, y1 = row
+        _text, x0, y0, x1, y1 = row
         if not item:
-            prev_bottom = y1
             continue
         display, side = item
-        gap_top = 1.5 if prev_bottom is None else prev_bottom + 0.6
-        room = (y0 - 1.0) - gap_top
-        size = shared
-        if room > 0:
-            size = min(size, max(floor, room / 0.92))
-        baseline = y0 - 0.8
-        top = baseline - size * 0.9
-        if top < gap_top:
-            baseline += gap_top - top
-        if baseline > y0 - 0.35:
-            baseline = y0 - 0.35
+        line_w = max(x1 - x0, 18)
+        size = target
         tw = _measure_line(page, display, size, font_kwargs)
-        while tw > width and size > 3.2:
+        while tw > line_w and size > floor:
             size -= 0.15
             tw = _measure_line(page, display, size, font_kwargs)
+        baseline = y0 + min(drop, max(1.2, (y1 - y0) * 0.22))
         if side == "rtl":
-            x = right - tw
-            if x < left:
-                x = left
+            x = x1 - tw
+            if x < x0:
+                x = x0
         else:
-            x = left
+            x = x0
         try:
             page.insert_text((x, baseline), display, fontsize=size, color=color, **font_kwargs)
         except Exception:
             page.insert_text((x, baseline), display, fontsize=size, color=color)
-        prev_bottom = y1
 
 
 def _translate_pdf_sentence_overlay(source: Path, out_path: Path, direction: str):
@@ -1097,7 +1075,7 @@ def _prepend_sentence_paragraph(para, direction: str):
         new_para = Paragraph(new_p, para._parent)
         new_para.paragraph_format.space_before = Pt(0)
         new_para.paragraph_format.space_after = Pt(0)
-        new_para.paragraph_format.line_spacing = 1.0
+        new_para.paragraph_format.line_spacing = 0.85
         new_para.paragraph_format.left_indent = src_fmt.left_indent
         new_para.paragraph_format.right_indent = src_fmt.right_indent
         rtl = direction == "en_ar" or is_mostly_arabic(translation)
@@ -1107,6 +1085,7 @@ def _prepend_sentence_paragraph(para, direction: str):
         tr_sz = scaled_pt(8)
         set_run_font(run, "Tahoma", max(6, int(round(tr_sz))))
         run.font.size = Pt(tr_sz)
+        _nudge_run_down(run, 2)
         _colorize_overlay_run(run)
 
 
