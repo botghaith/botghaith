@@ -21,7 +21,13 @@ from docx.text.run import Run
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
 from services.field_context import use_detected_field
-from services.translator import translate_text, resolve_direction, set_file_translation_mode, is_translator_ready
+from services.translator import (
+    translate_text,
+    resolve_direction,
+    set_file_translation_mode,
+    is_translator_ready,
+    split_units,
+)
 from config import use_fast_file_translation, prefer_local_for_files, is_render_host, file_max_paragraphs, use_dual_file_translation, use_full_file_translation
 from services.text_shape import (
     is_mostly_arabic,
@@ -924,6 +930,180 @@ def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
     src.close()
 
 
+_SENTENCE_END_RE = re.compile(r"[.!?؟…][\"')\]]*$")
+
+
+def _translate_as_sentences(text: str, direction: str) -> str:
+    """يترجم كل جملة مرة واحدة، ويرجعها جملة كاملة."""
+    raw = " ".join((text or "").split())
+    if not raw or not WORD_CHAR_RE.search(raw):
+        return ""
+    parts: list[str] = []
+    for unit in split_units(raw) or [raw]:
+        if not WORD_CHAR_RE.search(unit):
+            continue
+        translated = translate_text(unit, direction).strip()
+        if translated and not _same_token(translated, unit):
+            parts.append(translated)
+    return " ".join(parts)
+
+
+def _merge_lines_into_sentences(
+    lines: list[tuple[str, float, float, float, float]],
+) -> list[list[tuple[str, float, float, float, float]]]:
+    """الأسطر المقطوعة من نفس الجملة تترجم مرة واحدة."""
+    groups: list[list[tuple[str, float, float, float, float]]] = []
+    current: list[tuple[str, float, float, float, float]] = []
+    for line in lines:
+        text, x0, y0, x1, y1 = line
+        if current:
+            prev_text, px0, _py0, px1, py1 = current[-1]
+            gap = y0 - py1
+            line_h = max(y1 - y0, py1 - current[-1][2], 8)
+            overlap = min(px1, x1) - max(px0, x0)
+            continues = (
+                gap < line_h * 0.85
+                and overlap > 0
+                and not _SENTENCE_END_RE.search(prev_text.strip())
+            )
+            if continues:
+                current.append(line)
+                continue
+        if current:
+            groups.append(current)
+        current = [line]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _sentence_placements(
+    lines: list[tuple[str, float, float, float, float]], direction: str,
+) -> list[tuple[float, float, float, float, str]]:
+    placed: list[tuple[float, float, float, float, str]] = []
+    for group in _merge_lines_into_sentences(lines):
+        source = " ".join(item[0] for item in group)
+        translation = _translate_as_sentences(source, direction)
+        if not translation:
+            continue
+        first = group[0]
+        x0 = min(item[1] for item in group)
+        x1 = max(item[3] for item in group)
+        placed.append((x0, first[2], max(x1, x0 + 12), first[4], translation))
+    return placed
+
+
+def _iter_pdf_visual_lines(page) -> list[tuple[str, float, float, float, float]]:
+    lines: list[tuple[str, float, float, float, float]] = []
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+            if not text or not WORD_CHAR_RE.search(text):
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            lines.append((text, x0, y0, x1, y1))
+    return lines
+
+
+def _draw_sentence_placements(page, placements, fontfile: str | None, direction: str):
+    for x0, y0, x1, y1, translation in placements:
+        rtl = direction == "en_ar" or is_mostly_arabic(translation)
+        _pdf_insert_translation_above(page, x0, y0, x1, y1, translation, fontfile, rtl)
+
+
+def _translate_pdf_sentence_overlay(source: Path, out_path: Path, direction: str):
+    import fitz
+
+    src = fitz.open(str(source))
+    out = fitz.open()
+    fontfile = find_arabic_font()
+    for page_num in range(len(src)):
+        page = src[page_num]
+        new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+        new_page.show_pdf_page(page.rect, src, page_num)
+        lines = _iter_pdf_visual_lines(page)
+        if not lines:
+            continue
+        _draw_sentence_placements(
+            new_page, _sentence_placements(lines, direction), fontfile, direction,
+        )
+    out.save(str(out_path))
+    out.close()
+    src.close()
+
+
+def _prepend_sentence_paragraph(para, direction: str):
+    """يضيف ترجمة الجملة فوق الفقرة بدون ما يغيّر نصها أو تنسيقها."""
+    from docx.text.paragraph import Paragraph
+
+    text = para.text.strip()
+    translation = _translate_as_sentences(text, direction)
+    if not translation:
+        return
+    new_p = OxmlElement("w:p")
+    para._p.addprevious(new_p)
+    new_para = Paragraph(new_p, para._parent)
+    new_para.paragraph_format.space_before = Pt(0)
+    new_para.paragraph_format.space_after = Pt(0)
+    new_para.paragraph_format.line_spacing = 0.9
+    rtl = direction == "en_ar" or is_mostly_arabic(translation)
+    set_paragraph_direction(new_para, rtl)
+    if rtl:
+        new_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = new_para.add_run(translation)
+    tr_sz = scaled_pt(OVERLAY_TR_SIZE)
+    set_run_font(run, "Tahoma", max(5, int(round(tr_sz))))
+    run.font.size = Pt(tr_sz)
+    _colorize_overlay_run(run)
+
+
+def _process_docx_sentences(doc: Document, direction: str):
+    for para in list(doc.paragraphs):
+        if para.text.strip():
+            _prepend_sentence_paragraph(para, direction)
+    for table in list(doc.tables):
+        for row in table.rows:
+            for cell in row.cells:
+                for para in list(cell.paragraphs):
+                    if para.text.strip():
+                        _prepend_sentence_paragraph(para, direction)
+
+
+def _build_sentence_file(
+    source_path: Path, out_dir: Path, stem: str, direction: str, content: str,
+) -> dict[str, Path]:
+    direction = resolve_direction(content, direction)
+    suffix = source_path.suffix.lower()
+
+    if suffix in (".docx", ".doc"):
+        out = out_dir / f"{stem}_5_ترجمة_الجملة.docx"
+        shutil.copy2(source_path, out)
+        doc = Document(out)
+        _process_docx_sentences(doc, direction)
+        doc.save(out)
+        return {"sentence": out}
+
+    if suffix == ".pdf":
+        out = out_dir / f"{stem}_5_ترجمة_الجملة.pdf"
+        _translate_pdf_sentence_overlay(source_path, out, direction)
+        return {"sentence": out}
+
+    out = out_dir / f"{stem}_5_ترجمة_الجملة.txt"
+    blocks: list[str] = []
+    for line in content.splitlines():
+        if not line.strip():
+            blocks.append("")
+            continue
+        translation = _translate_as_sentences(line, direction)
+        if translation:
+            blocks.append(translation)
+        blocks.append(line)
+    out.write_text("\n".join(blocks), encoding="utf-8-sig")
+    return {"sentence": out}
+
+
 def _build_overlay_file(
     source_path: Path, out_dir: Path, stem: str, direction: str, content: str,
 ) -> dict[str, Path]:
@@ -1178,6 +1358,15 @@ def build_full_file_overlay(data: dict) -> Path:
         )["overlay"]
 
 
+def build_full_file_sentence(data: dict) -> Path:
+    set_file_translation_mode(True)
+    with use_detected_field(data.get("content") or ""):
+        return _build_sentence_file(
+            data["source_path"], data["output_dir"], data["stem"],
+            data["direction"], data["content"],
+        )["sentence"]
+
+
 def build_full_image_literal(data: dict) -> Path:
     set_file_translation_mode(True)
     return _build_literal_files(
@@ -1206,6 +1395,16 @@ def build_full_image_overlay(data: dict) -> Path:
     path = data["output_dir"] / f"{data['stem']}_4_فوق_الكلمات.pdf"
     with use_detected_field(data.get("content") or ""):
         _translate_image_overlay(
+            data["image_path"], data["layout"], path, data["direction"], data["content"],
+        )
+    return path
+
+
+def build_full_image_sentence(data: dict) -> Path:
+    set_file_translation_mode(True)
+    path = data["output_dir"] / f"{data['stem']}_5_ترجمة_الجملة.pdf"
+    with use_detected_field(data.get("content") or ""):
+        _translate_image_sentence(
             data["image_path"], data["layout"], path, data["direction"], data["content"],
         )
     return path
@@ -1275,6 +1474,43 @@ def _translate_image_structured(
         pad = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 40, rect.y1 + size * 2.5)
         _pdf_write_in_box(page, pad, new_text, scaled_pt(size), fontfile, rtl)
 
+    doc.save(str(out_path))
+    doc.close()
+
+
+def _lines_from_word_jobs(jobs: list[tuple]) -> list[tuple[str, float, float, float, float]]:
+    grouped: list[tuple[str, float, float, float, float]] = []
+    for token, x0, y0, x1, y1, line_text in jobs:
+        text = (line_text or token or "").strip()
+        if not text:
+            continue
+        if grouped:
+            prev_text, px0, py0, px1, py1 = grouped[-1]
+            same = abs(py0 - y0) < max(4.0, (py1 - py0) * 0.7) and prev_text == text
+            if same:
+                grouped[-1] = (text, min(px0, x0), min(py0, y0), max(px1, x1), max(py1, y1))
+                continue
+        grouped.append((text, x0, y0, x1, y1))
+    return grouped
+
+
+def _translate_image_sentence(
+    image_path: Path, layout: dict, out_path: Path, direction: str, content: str,
+):
+    import fitz
+
+    direction = resolve_direction(content, direction)
+    fontfile = find_arabic_font()
+    doc = fitz.open()
+    page = doc.new_page(width=layout["width"], height=layout["height"])
+    page.insert_image(page.rect, filename=str(image_path))
+    jobs = [
+        (token, x0, y0, x1, y1, line_text)
+        for token, x0, y0, x1, y1, line_text in layout.get("words", [])
+        if WORD_CHAR_RE.search(token) or WORD_CHAR_RE.search(line_text or "")
+    ]
+    lines = _lines_from_word_jobs(jobs)
+    _draw_sentence_placements(page, _sentence_placements(lines, direction), fontfile, direction)
     doc.save(str(out_path))
     doc.close()
 
