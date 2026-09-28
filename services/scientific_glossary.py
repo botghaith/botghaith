@@ -15,6 +15,7 @@ from services.glossary_med import MED_ENTRIES
 from services.glossary_more import MORE_ENTRIES
 from services.glossary_ref import REF_ENTRIES
 from services.glossary_sci import SCI_ENTRIES
+from services.glossary_struct import STRUCT_ENTRIES
 from services.field_context import sense_for
 from services.glossary_wide import WIDE_ENTRIES
 
@@ -1159,6 +1160,7 @@ def _build() -> None:
         + MORE_ENTRIES
         + WIDE_ENTRIES
         + REF_ENTRIES
+        + STRUCT_ENTRIES
     )
     ordered = sorted(all_entries, key=lambda item: (len(item[0]), item[0].count(" ")), reverse=True)
     for english, arabic in ordered:
