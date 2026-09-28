@@ -26,7 +26,6 @@ from services.translator import (
     resolve_direction,
     set_file_translation_mode,
     is_translator_ready,
-    split_units,
 )
 from config import use_fast_file_translation, prefer_local_for_files, is_render_host, file_max_paragraphs, use_dual_file_translation, use_full_file_translation
 from services.text_shape import (
@@ -930,87 +929,131 @@ def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
     src.close()
 
 
-_SENTENCE_END_RE = re.compile(r"[.!?؟…][\"')\]]*$")
-
-
-def _translate_as_sentences(text: str, direction: str) -> str:
-    """يترجم كل جملة مرة واحدة، ويرجعها جملة كاملة."""
+def _translate_one_line(text: str, direction: str) -> str:
+    """السطر كله وحدة ترجمة واحدة، بدون دمج ولا تقسيم."""
     raw = " ".join((text or "").split())
     if not raw or not WORD_CHAR_RE.search(raw):
         return ""
-    parts: list[str] = []
-    for unit in split_units(raw) or [raw]:
-        if not WORD_CHAR_RE.search(unit):
-            continue
-        translated = translate_text(unit, direction).strip()
-        if translated and not _same_token(translated, unit):
-            parts.append(translated)
-    return " ".join(parts)
+    translated = translate_text(raw, direction).strip()
+    if not translated or _same_token(translated, raw):
+        return ""
+    return translated
 
 
-def _merge_lines_into_sentences(
+def _coalesce_line_rows(
     lines: list[tuple[str, float, float, float, float]],
-) -> list[list[tuple[str, float, float, float, float]]]:
-    """الأسطر المقطوعة من نفس الجملة تترجم مرة واحدة."""
-    groups: list[list[tuple[str, float, float, float, float]]] = []
-    current: list[tuple[str, float, float, float, float]] = []
-    for line in lines:
-        text, x0, y0, x1, y1 = line
-        if current:
-            prev_text, px0, _py0, px1, py1 = current[-1]
-            gap = y0 - py1
-            line_h = max(y1 - y0, py1 - current[-1][2], 8)
-            overlap = min(px1, x1) - max(px0, x0)
-            continues = (
-                gap < line_h * 0.85
-                and overlap > 0
-                and not _SENTENCE_END_RE.search(prev_text.strip())
-            )
-            if continues:
-                current.append(line)
+) -> list[tuple[str, float, float, float, float]]:
+    """أجزاء نفس السطر تصير سطر واحد. السطر اللي تحته يبقى لحاله."""
+    ordered = sorted(lines, key=lambda item: (item[2], item[1]))
+    rows: list[tuple[str, float, float, float, float]] = []
+    for text, x0, y0, x1, y1 in ordered:
+        if rows:
+            prev_text, px0, py0, px1, py1 = rows[-1]
+            same_row = abs(y0 - py0) <= max(2.2, (y1 - y0) * 0.4)
+            if same_row:
+                if x0 < px0:
+                    merged = f"{text} {prev_text}".strip()
+                    nx0, nx1 = x0, max(x1, px1)
+                else:
+                    merged = f"{prev_text} {text}".strip()
+                    nx0, nx1 = px0, max(x1, px1)
+                rows[-1] = (merged, nx0, min(y0, py0), nx1, max(y1, py1))
                 continue
-        if current:
-            groups.append(current)
-        current = [line]
-    if current:
-        groups.append(current)
-    return groups
+        rows.append((text, x0, y0, x1, y1))
+    return rows
 
 
-def _sentence_placements(
-    lines: list[tuple[str, float, float, float, float]], direction: str,
-) -> list[tuple[float, float, float, float, str]]:
-    placed: list[tuple[float, float, float, float, str]] = []
-    for group in _merge_lines_into_sentences(lines):
-        source = " ".join(item[0] for item in group)
-        translation = _translate_as_sentences(source, direction)
-        if not translation:
-            continue
-        first = group[0]
-        x0 = min(item[1] for item in group)
-        x1 = max(item[3] for item in group)
-        placed.append((x0, first[2], max(x1, x0 + 12), first[4], translation))
-    return placed
-
-
-def _iter_pdf_visual_lines(page) -> list[tuple[str, float, float, float, float]]:
-    lines: list[tuple[str, float, float, float, float]] = []
+def _iter_pdf_line_blocks(page) -> list[list[tuple[str, float, float, float, float]]]:
+    blocks: list[list[tuple[str, float, float, float, float]]] = []
     for block in page.get_text("dict").get("blocks", []):
         if block.get("type") != 0:
             continue
+        raw: list[tuple[str, float, float, float, float]] = []
         for line in block.get("lines", []):
             text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
             if not text or not WORD_CHAR_RE.search(text):
                 continue
             x0, y0, x1, y1 = line["bbox"]
-            lines.append((text, x0, y0, x1, y1))
-    return lines
+            raw.append((text, x0, y0, x1, y1))
+        rows = _coalesce_line_rows(raw)
+        if rows:
+            blocks.append(rows)
+    return blocks
 
 
-def _draw_sentence_placements(page, placements, fontfile: str | None, direction: str):
-    for x0, y0, x1, y1, translation in placements:
+def _line_font_kwargs(fontfile: str | None) -> dict:
+    if not fontfile:
+        return {}
+    return {"fontfile": fontfile, "fontname": "TahomaAr"}
+
+
+def _measure_line(page, text: str, size: float, font_kwargs: dict) -> float:
+    import fitz
+
+    try:
+        return fitz.get_text_length(text, fontsize=size, **font_kwargs)
+    except Exception:
+        return len(text) * size * 0.45
+
+
+def _draw_line_block(page, rows, fontfile: str | None, direction: str):
+    """كل سطر ترجمته فوقه، بنفس حجم الخط وبعرض العمود."""
+    from services.text_shape import has_arabic
+
+    left = min(row[1] for row in rows)
+    right = max(row[3] for row in rows)
+    width = max(right - left, 16)
+    font_kwargs = _line_font_kwargs(fontfile)
+    prepared: list[tuple[str, str] | None] = []
+    for text, _x0, _y0, _x1, _y1 in rows:
+        translation = _translate_one_line(text, direction)
+        if not translation:
+            prepared.append(None)
+            continue
         rtl = direction == "en_ar" or is_mostly_arabic(translation)
-        _pdf_insert_translation_above(page, x0, y0, x1, y1, translation, fontfile, rtl)
+        display = shape_for_pdf(translation) if has_arabic(translation) else translation
+        prepared.append((display, "rtl" if rtl else "ltr"))
+
+    target = scaled_pt(8.0)
+    floor = scaled_pt(5.0, 4.2)
+    shared = target
+    for item in prepared:
+        if not item:
+            continue
+        display, _side = item
+        size = shared
+        while size > floor and _measure_line(page, display, size, font_kwargs) > width:
+            size -= 0.2
+        shared = min(shared, size)
+
+    prev_bottom = None
+    color = translation_color_rgb()
+    for row, item in zip(rows, prepared):
+        _text, _x0, y0, _x1, y1 = row
+        if not item:
+            prev_bottom = y1
+            continue
+        display, side = item
+        gap_top = 1.5 if prev_bottom is None else prev_bottom + 0.6
+        room = (y0 - 1.0) - gap_top
+        size = shared
+        if room > 0:
+            size = min(size, max(floor, room / 0.92))
+        baseline = y0 - 0.8
+        top = baseline - size * 0.9
+        if top < gap_top:
+            baseline += gap_top - top
+        if baseline > y0 - 0.35:
+            baseline = y0 - 0.35
+        tw = _measure_line(page, display, size, font_kwargs)
+        x = right - tw if side == "rtl" else left
+        if side == "rtl":
+            x = max(left, min(x, right - 2))
+        try:
+            page.insert_text((x, baseline), display, fontsize=size, color=color, **font_kwargs)
+        except Exception:
+            page.insert_text((x, baseline), display, fontsize=size, color=color)
+        prev_bottom = y1
 
 
 def _translate_pdf_sentence_overlay(source: Path, out_path: Path, direction: str):
@@ -1023,12 +1066,8 @@ def _translate_pdf_sentence_overlay(source: Path, out_path: Path, direction: str
         page = src[page_num]
         new_page = out.new_page(width=page.rect.width, height=page.rect.height)
         new_page.show_pdf_page(page.rect, src, page_num)
-        lines = _iter_pdf_visual_lines(page)
-        if not lines:
-            continue
-        _draw_sentence_placements(
-            new_page, _sentence_placements(lines, direction), fontfile, direction,
-        )
+        for block in _iter_pdf_line_blocks(page):
+            _draw_line_block(new_page, block, fontfile, direction)
     out.save(str(out_path))
     out.close()
     src.close()
@@ -1038,25 +1077,30 @@ def _prepend_sentence_paragraph(para, direction: str):
     """يضيف ترجمة الجملة فوق الفقرة بدون ما يغيّر نصها أو تنسيقها."""
     from docx.text.paragraph import Paragraph
 
-    text = para.text.strip()
-    translation = _translate_as_sentences(text, direction)
-    if not translation:
+    lines = [line.strip() for line in para.text.splitlines() if line.strip()]
+    if not lines:
         return
-    new_p = OxmlElement("w:p")
-    para._p.addprevious(new_p)
-    new_para = Paragraph(new_p, para._parent)
-    new_para.paragraph_format.space_before = Pt(0)
-    new_para.paragraph_format.space_after = Pt(0)
-    new_para.paragraph_format.line_spacing = 0.9
-    rtl = direction == "en_ar" or is_mostly_arabic(translation)
-    set_paragraph_direction(new_para, rtl)
-    if rtl:
-        new_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = new_para.add_run(translation)
-    tr_sz = scaled_pt(OVERLAY_TR_SIZE)
-    set_run_font(run, "Tahoma", max(5, int(round(tr_sz))))
-    run.font.size = Pt(tr_sz)
-    _colorize_overlay_run(run)
+    src_fmt = para.paragraph_format
+    for line in reversed(lines):
+        translation = _translate_one_line(line, direction)
+        if not translation:
+            continue
+        new_p = OxmlElement("w:p")
+        para._p.addprevious(new_p)
+        new_para = Paragraph(new_p, para._parent)
+        new_para.paragraph_format.space_before = Pt(0)
+        new_para.paragraph_format.space_after = Pt(0)
+        new_para.paragraph_format.line_spacing = 1.0
+        new_para.paragraph_format.left_indent = src_fmt.left_indent
+        new_para.paragraph_format.right_indent = src_fmt.right_indent
+        rtl = direction == "en_ar" or is_mostly_arabic(translation)
+        set_paragraph_direction(new_para, rtl)
+        new_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT if rtl else WD_ALIGN_PARAGRAPH.LEFT
+        run = new_para.add_run(translation)
+        tr_sz = scaled_pt(8)
+        set_run_font(run, "Tahoma", max(6, int(round(tr_sz))))
+        run.font.size = Pt(tr_sz)
+        _colorize_overlay_run(run)
 
 
 def _process_docx_sentences(doc: Document, direction: str):
@@ -1096,7 +1140,7 @@ def _build_sentence_file(
         if not line.strip():
             blocks.append("")
             continue
-        translation = _translate_as_sentences(line, direction)
+        translation = _translate_one_line(line, direction)
         if translation:
             blocks.append(translation)
         blocks.append(line)
@@ -1509,8 +1553,9 @@ def _translate_image_sentence(
         for token, x0, y0, x1, y1, line_text in layout.get("words", [])
         if WORD_CHAR_RE.search(token) or WORD_CHAR_RE.search(line_text or "")
     ]
-    lines = _lines_from_word_jobs(jobs)
-    _draw_sentence_placements(page, _sentence_placements(lines, direction), fontfile, direction)
+    lines = _coalesce_line_rows(_lines_from_word_jobs(jobs))
+    if lines:
+        _draw_line_block(page, lines, fontfile, direction)
     doc.save(str(out_path))
     doc.close()
 
