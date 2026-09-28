@@ -15,6 +15,7 @@ from services.glossary_med import MED_ENTRIES
 from services.glossary_more import MORE_ENTRIES
 from services.glossary_ref import REF_ENTRIES
 from services.glossary_sci import SCI_ENTRIES
+from services.field_context import sense_for
 from services.glossary_wide import WIDE_ENTRIES
 
 # كلمات تحتمل أكثر من معنى: تُترجم علمياً إذا كانت النص كله،
@@ -1220,7 +1221,7 @@ def lookup_preserving(text: str, direction: str) -> str | None:
     if len(core) < 2:
         return None
     if direction == "en_ar":
-        hit = _lookup_english(core)
+        hit = sense_for(core) or _lookup_english(core)
     else:
         hit = _lookup_arabic(core)
     if not hit:
@@ -1233,6 +1234,7 @@ def _apply_patterns(
     patterns: list[tuple[re.Pattern[str], str, str]],
     *,
     english: bool,
+    respect_field: bool = False,
 ) -> str:
     if not text:
         return text
@@ -1245,6 +1247,8 @@ def _apply_patterns(
 
     hay = text.casefold() if english else text
     for pattern, needle, target in patterns:
+        if respect_field and sense_for(needle):
+            continue
         probe = needle if english else needle
         if english:
             if probe not in hay:
@@ -1269,5 +1273,5 @@ def apply_known_terms(text: str, direction: str) -> str:
 def repair_copied(text: str, direction: str) -> str:
     """يستبدل المصطلح الذي أرجعه المحرك كما هو بترجمته العلمية."""
     if direction == "en_ar":
-        return _apply_patterns(text, _EN_ALL, english=True)
+        return _apply_patterns(text, _EN_ALL, english=True, respect_field=True)
     return _apply_patterns(text, _AR_ALL, english=False)

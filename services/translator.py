@@ -8,6 +8,7 @@ import urllib.request
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR قبل argostranslate
 from config import use_online_translate, prefer_local_for_files
+from services.field_context import apply_field_terms, use_detected_field
 from services.scientific_glossary import (
     apply_known_terms,
     lookup_preserving,
@@ -593,9 +594,11 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
         return composed
 
     prepared = apply_known_terms(text, direction)
+    prepared = apply_field_terms(prepared, direction)
     prepared = _fold_of_phrases(prepared, direction)
     translated = _dispatch_translation(prepared, text, direction)
     translated = repair_copied(translated, direction)
+    translated = apply_field_terms(translated, direction)
     translated = fill_copied_words(text, translated, direction)
     translated = _strip_added_markers(text, translated)
     if direction == "en_ar":
@@ -651,6 +654,11 @@ def translate_interleaved(text: str, direction: str = "en_ar") -> str:
 def translate_text_dual(text: str, direction: str = "auto") -> tuple[str, str]:
     """ترجمة واحدة للنص — عرض ثنائي + نص كامل."""
     direction = resolve_direction(text, direction)
+    with use_detected_field(text):
+        return _dual_from_units(text, direction)
+
+
+def _dual_from_units(text: str, direction: str) -> tuple[str, str]:
     pairs = [(unit, translate_text(unit, direction)) for unit in split_units(text)]
     interleaved = "\n\n".join(
         f"<b>{_esc(src)}</b>\n<i>{_esc(tr)}</i>" for src, tr in pairs

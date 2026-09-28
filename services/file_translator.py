@@ -20,6 +20,7 @@ from docx.text.run import Run
 
 from services.file_extractor import extract_text_from_file
 from services.pdf_service import create_bilingual_pdf, create_pairs_pdf, create_literal_pdf
+from services.field_context import use_detected_field
 from services.translator import translate_text, resolve_direction, set_file_translation_mode, is_translator_ready
 from config import use_fast_file_translation, prefer_local_for_files, is_render_host, file_max_paragraphs, use_dual_file_translation, use_full_file_translation
 from services.text_shape import (
@@ -1170,10 +1171,11 @@ def build_full_file_line_pairs(data: dict) -> Path:
 
 def build_full_file_overlay(data: dict) -> Path:
     set_file_translation_mode(True)
-    return _build_overlay_file(
-        data["source_path"], data["output_dir"], data["stem"],
-        data["direction"], data["content"],
-    )["overlay"]
+    with use_detected_field(data.get("content") or ""):
+        return _build_overlay_file(
+            data["source_path"], data["output_dir"], data["stem"],
+            data["direction"], data["content"],
+        )["overlay"]
 
 
 def build_full_image_literal(data: dict) -> Path:
@@ -1202,9 +1204,10 @@ def build_full_image_line_pairs(data: dict) -> Path:
 def build_full_image_overlay(data: dict) -> Path:
     set_file_translation_mode(True)
     path = data["output_dir"] / f"{data['stem']}_4_فوق_الكلمات.pdf"
-    _translate_image_overlay(
-        data["image_path"], data["layout"], path, data["direction"], data["content"],
-    )
+    with use_detected_field(data.get("content") or ""):
+        _translate_image_overlay(
+            data["image_path"], data["layout"], path, data["direction"], data["content"],
+        )
     return path
 
 
@@ -1350,7 +1353,8 @@ def translate_file_fast(
     direction = resolve_direction(content, direction)
 
     logger.info("Fast file translation: %s (%d chars)", source_path.name, len(content))
-    pairs = _translate_paragraph_pairs(content, direction)
+    with use_detected_field(content):
+        pairs = _translate_paragraph_pairs(content, direction)
     if not pairs:
         raise ValueError("لم يتم العثور على فقرات للترجمة")
     return _build_fast_outputs(pairs, output_dir, stem, direction)
@@ -1372,7 +1376,8 @@ def translate_image_fast(
     direction = resolve_direction(content, direction)
 
     logger.info("Fast image translation: %s (%d chars)", image_path.name, len(content))
-    pairs = _translate_paragraph_pairs(content, direction)
+    with use_detected_field(content):
+        pairs = _translate_paragraph_pairs(content, direction)
     if not pairs:
         raise ValueError("لم يتم العثور على نص للترجمة في الصورة")
     return _build_fast_outputs(pairs, output_dir, stem, direction)
@@ -1493,6 +1498,15 @@ def _translate_file_full(
         raise ValueError("لم يتم العثور على نص في الملف")
     direction = resolve_direction(sample, direction)
     logger.info("Full translation (4 files): %s", source_path.name)
+    with use_detected_field(sample):
+        return _translate_file_full_body(
+            source_path, output_dir, direction, sample, suffix, stem,
+        )
+
+
+def _translate_file_full_body(
+    source_path: Path, output_dir: Path, direction: str, sample: str, suffix: str, stem: str,
+) -> dict[str, Path]:
     logger.info("Step 1-2/4: literal + structured...")
     if suffix in (".docx", ".doc"):
         result = _translate_docx(source_path, output_dir, stem, direction)
