@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+from services.glossary_extra import EXTRA_ALIASES, EXTRA_ENTRIES, EXTRA_FORCE_SHORT
+
 # كلمات تحتمل أكثر من معنى: تُترجم علمياً إذا كانت النص كله،
 # ولا تُفرض داخل الجملة حتى يبقى السياق للمحرك.
 AMBIGUOUS = {
@@ -1126,7 +1128,7 @@ def _is_forced(english: str) -> bool:
         return False
     if " " in key or "-" in key:
         return True
-    if key in FORCE_SHORT:
+    if key in FORCE_SHORT or key in EXTRA_FORCE_SHORT:
         return True
     return len(key) >= 8
 
@@ -1139,7 +1141,8 @@ _AR_ALL: list[tuple[re.Pattern[str], str, str]] = []
 
 
 def _build() -> None:
-    ordered = sorted(ENTRIES, key=lambda item: (len(item[0]), item[0].count(" ")), reverse=True)
+    all_entries = ENTRIES + EXTRA_ENTRIES
+    ordered = sorted(all_entries, key=lambda item: (len(item[0]), item[0].count(" ")), reverse=True)
     for english, arabic in ordered:
         ek = _norm_en(english)
         if not ek or not arabic:
@@ -1152,8 +1155,9 @@ def _build() -> None:
         if _is_forced(english):
             _EN_FORCE.append((compiled, needle, arabic))
 
-    ar_pairs = [(arabic, english) for english, arabic in ENTRIES]
+    ar_pairs = [(arabic, english) for english, arabic in all_entries]
     ar_pairs.extend(AR_ALIASES)
+    ar_pairs.extend(EXTRA_ALIASES)
     ar_pairs.sort(key=lambda item: len(item[0]), reverse=True)
     seen_surface: set[str] = set()
     for arabic, english in ar_pairs:

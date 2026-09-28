@@ -352,52 +352,13 @@ def _strip_added_markers(source: str, translated: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
-def _clean_term_translation(text: str, original: str) -> str | None:
-    cleaned = _strip_added_markers(original, (text or "").strip()).strip(" .،")
-    if not cleaned or _texts_match(cleaned, original):
-        return None
-    if len(cleaned.split()) > 8:
-        return None
-    return cleaned
-
-
 def _batch_translate_words(words: list[str], direction: str) -> dict[str, str]:
-    """ترجمة الكلمات التي نسخت كما هي، بدون أرقام أو عناوين إضافية."""
+    """يستبدل الكلمة المنسوخة فقط إذا كانت في القاموس. الكلمة غير المعروفة لا تُترجم وحدها."""
     resolved: dict[str, str] = {}
-    pending: list[str] = []
     for word in words:
         hit = lookup_preserving(word, direction)
         if hit and not _texts_match(hit, word):
             resolved[word.casefold()] = _strip_added_markers(word, hit)
-        else:
-            pending.append(word)
-
-    step = 20
-    for start in range(0, len(pending), step):
-        chunk = pending[start:start + step]
-        parsed: list[str] | None = None
-        try:
-            raw = _online_translate("\n".join(chunk), direction)
-            lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
-            if len(lines) == len(chunk):
-                parsed = lines
-        except Exception as error:
-            logger.warning("Leftover word batch failed: %s", error)
-        if parsed is None:
-            for word in chunk:
-                try:
-                    one = _online_translate(word, direction)
-                except Exception as error:
-                    logger.debug("Single leftover word failed (%s): %s", word, error)
-                    continue
-                cleaned = _clean_term_translation(one, word)
-                if cleaned:
-                    resolved[word.casefold()] = cleaned
-            continue
-        for word, item in zip(chunk, parsed):
-            cleaned = _clean_term_translation(item, word)
-            if cleaned:
-                resolved[word.casefold()] = cleaned
     return resolved
 
 
@@ -418,33 +379,6 @@ def fill_copied_words(source: str, translated: str, direction: str) -> str:
     if translated != source:
         logger.info("Filled %d untranslated words", len(mapping))
     return translated
-
-
-def _should_rescue(text: str, direction: str) -> bool:
-    if not _is_translatable_source(text, direction):
-        return False
-    words = re.findall(r"[\w\u0600-\u06FF]+", text, re.UNICODE)
-    return 0 < len(words) <= 4 and len(text) <= 80
-
-
-def _rescue_term(text: str, direction: str) -> str | None:
-    """محاولة أخيرة لمصطلح قصير رجع كما هو، بدون إضافة أرقام أو عناوين."""
-    raw = (text or "").strip()
-    match = re.match(r"^([^\w\u0600-\u06FF]*)(.*?)([^\w\u0600-\u06FF]*)$", raw, re.DOTALL)
-    if not match:
-        return None
-    prefix, core, suffix = match.group(1), match.group(2).strip(), match.group(3)
-    if len(core) < 2:
-        return None
-    try:
-        out = _google_translate(core, direction)
-    except Exception as e:
-        logger.debug("Scientific term rescue failed: %s", e)
-        return None
-    cleaned = _clean_term_translation(out or "", core)
-    if not cleaned:
-        return None
-    return f"{prefix}{cleaned}{suffix}"
 
 
 def _dispatch_translation(prepared: str, original: str, direction: str) -> str:
@@ -517,11 +451,6 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
     translated = _dispatch_translation(prepared, text, direction)
     translated = repair_copied(translated, direction)
     translated = fill_copied_words(text, translated, direction)
-
-    if _texts_match(translated, text) and _should_rescue(text, direction):
-        rescued = _rescue_term(text, direction)
-        if rescued:
-            translated = repair_copied(rescued, direction)
     return _strip_added_markers(text, translated)
 
 
