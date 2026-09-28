@@ -113,14 +113,23 @@ def group_tokens(tokens: list[str], direction: str) -> list[list[str]]:
     return groups
 
 
+def _echoes_source(translation: str, tokens: list[str]) -> bool:
+    src = " ".join(_token_core(token) for token in tokens if _token_core(token))
+    return _same_token(translation, src)
+
+
 def translate_token_group(tokens: list[str], direction: str) -> str:
     words = [token for token in tokens if WORD_CHAR_RE.search(token)]
     if not words:
         return ""
     if len(words) == 1:
-        return translate_word(words[0], direction)
-    phrase = " ".join(_token_core(token) for token in words if _token_core(token))
-    return translate_text(phrase, direction)
+        translated = translate_word(words[0], direction)
+    else:
+        phrase = " ".join(_token_core(token) for token in words if _token_core(token))
+        translated = translate_text(phrase, direction)
+    if _echoes_source(translated, words):
+        return ""
+    return translated
 
 
 def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
@@ -702,8 +711,8 @@ def _add_overlay_runs_at_index(
     tokens = WORD_TOKEN_RE.findall(text)
     for group in group_tokens(tokens, direction):
         words = [token for token in group if WORD_CHAR_RE.search(token)]
-        if words:
-            tr = translate_token_group(words, direction)
+        tr = translate_token_group(words, direction) if words else ""
+        if tr.strip():
             r = OxmlElement("w:r")
             parent.insert(insert_idx, r)
             insert_idx += 1
@@ -779,8 +788,8 @@ def _replace_paragraph_with_overlay_table(doc: Document, para, direction: str):
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         words = [token for token in group if WORD_CHAR_RE.search(token)]
-        if words:
-            tr = translate_token_group(words, direction)
+        tr = translate_token_group(words, direction) if words else ""
+        if tr.strip():
             tr_run = p.add_run(tr)
             tr_sz = scaled_pt(OVERLAY_TR_SIZE)
             set_run_font(tr_run, "Tahoma", max(5, int(round(tr_sz))))
@@ -889,6 +898,8 @@ def _translate_pdf_overlay(source: Path, out_path: Path, direction: str):
             continue
 
         for token, x0, y0, x1, y1, tr in _grouped_overlay_jobs(word_jobs, direction):
+            if not (tr or "").strip():
+                continue
             rtl = direction == "en_ar" or is_mostly_arabic(tr)
             _pdf_insert_translation_above(new_page, x0, y0, x1, y1, tr, fontfile, rtl)
 
@@ -1268,6 +1279,8 @@ def _translate_image_overlay(
         if WORD_CHAR_RE.search(token)
     ]
     for token, x0, y0, x1, y1, tr in _grouped_overlay_jobs(words, direction):
+        if not (tr or "").strip():
+            continue
         rtl = direction == "en_ar" or is_mostly_arabic(tr)
         _pdf_insert_translation_above(page, x0, y0, x1, y1, tr, fontfile, rtl)
 

@@ -487,8 +487,23 @@ def _bind_arabic_prep(prep: str, phrase: str) -> str:
     return f"{prep} {phrase}".strip()
 
 
+_OF_SKIP_HEAD = frozenset({
+    "of", "in", "on", "at", "to", "for", "from", "with", "by", "as",
+    "into", "onto", "over", "under", "about", "between", "through",
+    "during", "without", "within", "upon", "per",
+    "the", "a", "an", "is", "are", "was", "were", "and", "or", "but",
+})
+_OF_FOLLOW = re.compile(
+    r"\bof\s+(?:(?P<article>the|a|an)\s+)?"
+    r"(?P<head>(?!(?:of|in|on|at|to|for|from|with|by|as|into|onto|over|under|"
+    r"about|between|through|during|without|within|upon|per|the|a|an|is|are|was|were|and|or|but)\b)"
+    r"[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,2})",
+    re.IGNORECASE,
+)
+
+
 def _compose_closed_phrase(text: str, direction: str) -> str | None:
-    """the flower → الزهرة، مو ال + زهرة كل وحدة لحال."""
+    """the flower → الزهرة. of the flower → الزهرة، مو of لحالها."""
     if direction != "en_ar":
         return None
     raw = re.sub(r"\s+", " ", (text or "")).strip(" .،!?؟")
@@ -505,11 +520,62 @@ def _compose_closed_phrase(text: str, direction: str) -> str | None:
     noun = translate_text(head, direction).strip()
     if not ARABIC_RE.search(noun):
         return None
-    if article == "the":
+    # of ما تنكتب. ترتبط بالكلمة اللي بعدها: of the flower = الزهرة
+    definite = article == "the" or (prep == "of" and article not in {"a", "an"})
+    if definite:
         noun = _arabic_definite(noun)
+    if prep == "of":
+        return noun
     if prep:
         noun = _bind_arabic_prep(_EN_PREP_AR[prep], noun)
     return noun
+
+
+def _fold_of_phrases(text: str, direction: str) -> str:
+    """of + الكلمة اللي بعدها تصير عبارة عربية واحدة، وof ما تبقى بالنص."""
+    if direction != "en_ar" or not text or not _OF_FOLLOW.search(text):
+        return text
+
+    def repl(match: re.Match) -> str:
+        article = (match.group("article") or "").lower()
+        words = (match.group("head") or "").split()
+        kept: list[str] = []
+        for word in words:
+            if word.casefold() in _OF_SKIP_HEAD:
+                break
+            kept.append(word)
+        if not kept:
+            return match.group(0)
+        noun = translate_text(" ".join(kept), direction).strip()
+        if not ARABIC_RE.search(noun):
+            return match.group(0)
+        if article not in {"a", "an"}:
+            noun = _arabic_definite(noun)
+        rest = words[len(kept):]
+        tail = f" {' '.join(rest)}" if rest else ""
+        return f"{noun}{tail}"
+
+    previous = None
+    while previous != text:
+        previous = text
+        updated = _OF_FOLLOW.sub(repl, text)
+        if updated == text:
+            break
+        text = updated
+    return text
+
+
+def _drop_copied_of(text: str) -> str:
+    """إذا of رجعت كما هي، أو انكتبت مرتين، تنحذف وما تنعاد."""
+    cleaned = text or ""
+    cleaned = re.sub(r"\bof(?:\s+of)+\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bof\s+(?=[\u0600-\u06FF])", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(?<=[\u0600-\u06FF])\s+of\b", "", cleaned, flags=re.IGNORECASE)
+    if re.fullmatch(r"of", cleaned.strip(), flags=re.IGNORECASE):
+        return ""
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([،.!?؟:;])", r"\1", cleaned)
+    return cleaned.strip()
 
 
 def translate_text(text: str, direction: str = "en_ar") -> str:
@@ -527,10 +593,14 @@ def translate_text(text: str, direction: str = "en_ar") -> str:
         return composed
 
     prepared = apply_known_terms(text, direction)
+    prepared = _fold_of_phrases(prepared, direction)
     translated = _dispatch_translation(prepared, text, direction)
     translated = repair_copied(translated, direction)
     translated = fill_copied_words(text, translated, direction)
-    return _strip_added_markers(text, translated)
+    translated = _strip_added_markers(text, translated)
+    if direction == "en_ar":
+        translated = _drop_copied_of(translated)
+    return translated
 
 
 def translate_units(text: str, direction: str = "en_ar") -> list[tuple[str, str]]:
