@@ -8,6 +8,11 @@ import urllib.request
 
 import config  # noqa: F401 — ARGOS_PACKAGES_DIR قبل argostranslate
 from config import use_online_translate, prefer_local_for_files
+from services.scientific_glossary import (
+    apply_known_terms,
+    lookup_preserving,
+    repair_copied,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -260,37 +265,270 @@ def _online_translate_long(text: str, direction: str) -> str:
     return "\n".join(parts).strip()
 
 
+def _texts_match(left: str, right: str) -> bool:
+    def _norm(value: str) -> str:
+        return " ".join((value or "").split()).casefold()
+
+    return _norm(left) == _norm(right)
+
+
+def _is_translatable_source(text: str, direction: str) -> bool:
+    """نص فيه حروف حقيقية، وليس رقماً أو رمزاً أو رابطاً."""
+    if re.search(r"https?://|www\.|@\w", text or "", re.I):
+        return False
+    if re.fullmatch(r"[\d\s\W_]+", text or "", flags=re.UNICODE):
+        return False
+    ar = len(ARABIC_RE.findall(text))
+    en = len(re.findall(r"[A-Za-z]", text))
+    if direction == "en_ar":
+        return en >= 2 and en >= ar
+    return ar >= 2 and ar >= en
+
+
+def _copied_source(result: str, source: str, direction: str) -> bool:
+    return _texts_match(result, source) and _is_translatable_source(source, direction)
+
+
+_LATIN_TOKEN = re.compile(r"[A-Za-z]{2,}(?:-[A-Za-z0-9]+)*")
+_AR_TOKEN = re.compile(r"[\u0600-\u06FF]{2,}")
+_ROMAN = re.compile(r"^(?:i{1,3}|iv|vi{0,3}|ix|xi{0,2}|x)$", re.I)
+
+
+def _leftover_words(source: str, translated: str, direction: str) -> list[str]:
+    """كلمات لغة المصدر التي بقيت كما هي داخل الناتج."""
+    if direction == "en_ar":
+        source_words = {w.casefold() for w in _LATIN_TOKEN.findall(source or "")}
+        pattern = _LATIN_TOKEN
+    else:
+        source_words = {w for w in _AR_TOKEN.findall(source or "")}
+        pattern = _AR_TOKEN
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(translated or ""):
+        word = match.group(0)
+        key = word.casefold() if direction == "en_ar" else word
+        if key in seen or key not in source_words:
+            continue
+        if direction == "en_ar" and _ROMAN.fullmatch(word):
+            continue
+        window = (translated or "")[max(0, match.start() - 24):match.start()].lower()
+        if "http" in window or "www." in window:
+            continue
+        seen.add(key)
+        found.append(word)
+    found.sort(key=len, reverse=True)
+    return found
+
+
+def _parse_numbered_lines(text: str, expected: int) -> list[str] | None:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    parsed: list[str] = []
+    for line in lines:
+        match = re.match(r"^\d+\.\s*(.+)$", line)
+        parsed.append(match.group(1).strip() if match else line)
+    if len(parsed) != expected:
+        return None
+    return parsed
+
+
+def _clean_term_translation(text: str, original: str) -> str | None:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^\d+\.\s*", "", cleaned).strip(" .،")
+    if ":" in cleaned or "：" in cleaned:
+        tail = re.split(r"[:：]", cleaned, maxsplit=1)[-1].strip(" .،")
+        if tail and not _texts_match(tail, original):
+            cleaned = tail
+    if not cleaned or _texts_match(cleaned, original):
+        return None
+    if len(cleaned.split()) > 8:
+        return None
+    return cleaned
+
+
+def _batch_translate_words(words: list[str], direction: str, *, carrier: bool) -> dict[str, str]:
+    """ترجمة الكلمات التي نسخت كما هي. لا يمر عبر translate_text حتى لا تتكرر المحاولة."""
+    resolved: dict[str, str] = {}
+    pending: list[str] = []
+    for word in words:
+        hit = lookup_preserving(word, direction)
+        if hit and not _texts_match(hit, word):
+            resolved[word.casefold()] = hit.strip(" .،")
+        else:
+            pending.append(word)
+
+    step = 25
+    for start in range(0, len(pending), step):
+        chunk = pending[start:start + step]
+        if carrier:
+            rendered = [
+                f"scientific term: {word}" if direction == "en_ar" else f"مصطلح علمي: {word}"
+                for word in chunk
+            ]
+        else:
+            rendered = chunk
+        payload = "\n".join(f"{index}. {item}" for index, item in enumerate(rendered, 1))
+        parsed: list[str] | None = None
+        try:
+            raw = _online_translate(payload, direction)
+            parsed = _parse_numbered_lines(raw, len(chunk))
+        except Exception as error:
+            logger.warning("Leftover word batch failed: %s", error)
+        if parsed is None:
+            for word in chunk:
+                probe = (
+                    f"scientific term: {word}" if carrier or direction == "en_ar" else f"مصطلح علمي: {word}"
+                )
+                try:
+                    one = _online_translate(probe if carrier else word, direction)
+                except Exception as error:
+                    logger.debug("Single leftover word failed (%s): %s", word, error)
+                    continue
+                cleaned = _clean_term_translation(one, word)
+                if not cleaned and not carrier:
+                    try:
+                        one = _online_translate(probe, direction)
+                    except Exception:
+                        one = ""
+                    cleaned = _clean_term_translation(one, word)
+                if cleaned:
+                    resolved[word.casefold()] = cleaned
+            continue
+        for word, item in zip(chunk, parsed):
+            cleaned = _clean_term_translation(item, word)
+            if cleaned:
+                resolved[word.casefold()] = cleaned
+    return resolved
+
+
+def fill_copied_words(source: str, translated: str, direction: str) -> str:
+    """يستبدل كل كلمة بقيت بلغة المصدر بترجمتها."""
+    leftovers = _leftover_words(source, translated, direction)
+    if not leftovers:
+        return translated
+    whole_copied = _texts_match(translated, source)
+    mapping = _batch_translate_words(leftovers, direction, carrier=whole_copied)
+    if not mapping:
+        return translated
+    for word in leftovers:
+        replacement = mapping.get(word.casefold())
+        if not replacement:
+            continue
+        pattern = re.compile(rf"(?<![\w\u0600-\u06FF]){re.escape(word)}(?![\w\u0600-\u06FF])", re.I)
+        translated = pattern.sub(lambda _match, repl=replacement: repl, translated)
+    if translated != source:
+        logger.info("Filled %d untranslated words", len(mapping))
+    return translated
+
+
+def _should_rescue(text: str, direction: str) -> bool:
+    if not _is_translatable_source(text, direction):
+        return False
+    words = re.findall(r"[\w\u0600-\u06FF]+", text, re.UNICODE)
+    return 0 < len(words) <= 4 and len(text) <= 80
+
+
+def _rescue_term(text: str, direction: str) -> str | None:
+    """محاولة أخيرة لمصطلح قصير رجع كما هو، بصيغة سؤال علمي."""
+    raw = (text or "").strip()
+    match = re.match(r"^([^\w\u0600-\u06FF]*)(.*?)([^\w\u0600-\u06FF]*)$", raw, re.DOTALL)
+    if not match:
+        return None
+    prefix, core, suffix = match.group(1), match.group(2).strip(), match.group(3)
+    if len(core) < 2:
+        return None
+    probe = f"scientific term: {core}" if direction == "en_ar" else f"مصطلح علمي: {core}"
+    try:
+        out = _google_translate(probe, direction)
+    except Exception as e:
+        logger.debug("Scientific term rescue failed: %s", e)
+        return None
+    if not out:
+        return None
+    parts = re.split(r"[:：]", out, maxsplit=1)
+    if len(parts) < 2:
+        return None
+    tail = parts[1].strip().strip(" .،")
+    if not tail or _texts_match(tail, core) or _texts_match(tail, raw):
+        return None
+    return f"{prefix}{tail}{suffix}"
+
+
+def _dispatch_translation(prepared: str, original: str, direction: str) -> str:
+    """أونلاين أدق للجمل العلمية. Argos يبقى للملف العام، ويُستبدل إذا نسخ النص."""
+    prefer_fast_local = (
+        _is_file_translation_mode()
+        and prefer_local_for_files()
+        and prepared == original
+    )
+    errors: list[str] = []
+    local_copy: str | None = None
+    online_tried = False
+
+    if prefer_fast_local and _ensure_translator():
+        try:
+            local = _argos_translate(prepared, direction)
+            if not _copied_source(local, original, direction):
+                return local
+            local_copy = local
+            logger.info("Local engine copied the text, trying online")
+        except Exception as e:
+            errors.append(str(e))
+            logger.warning("Local file translation failed, trying online: %s", e)
+
+    # حتى مع وضع أوفلاين: إذا النص رجع كما هو نحاول أونلاين، وإلا تبقى الكلمات بلا ترجمة
+    if use_online_translate() or local_copy is not None:
+        online_tried = True
+        try:
+            return _online_translate_long(prepared, direction)
+        except Exception as e:
+            errors.append(str(e))
+            logger.warning("Online translation failed, trying Argos fallback: %s", e)
+
+    if _ensure_translator() and local_copy is None:
+        try:
+            local = _argos_translate(prepared, direction)
+            if not _copied_source(local, original, direction):
+                return local
+            local_copy = local
+            logger.info("Argos copied the text, trying online")
+        except Exception as e:
+            errors.append(str(e))
+            logger.warning("Argos translation failed: %s", e)
+
+    if local_copy is not None and not online_tried:
+        try:
+            return _online_translate_long(prepared, direction)
+        except Exception as e:
+            errors.append(str(e))
+            logger.warning("Online translation failed after copied text: %s", e)
+
+    if local_copy is not None:
+        return local_copy
+
+    detail = errors[-1] if errors else "لا توجد خدمة متاحة"
+    raise RuntimeError(f"تعذرت الترجمة: {detail}")
+
+
 def translate_text(text: str, direction: str = "en_ar") -> str:
     text = (text or "").strip()
     if not text:
         return ""
     direction = resolve_direction(text, direction)
 
-    use_local_first = _is_file_translation_mode() and prefer_local_for_files()
+    exact = lookup_preserving(text, direction)
+    if exact is not None:
+        return exact
 
-    if use_local_first and _ensure_translator():
-        try:
-            return _argos_translate(text, direction)
-        except Exception as e:
-            logger.warning("Local file translation failed, trying online: %s", e)
+    prepared = apply_known_terms(text, direction)
+    translated = _dispatch_translation(prepared, text, direction)
+    translated = repair_copied(translated, direction)
+    translated = fill_copied_words(text, translated, direction)
 
-    if use_online_translate() and not use_local_first:
-        try:
-            return _online_translate_long(text, direction)
-        except Exception as e:
-            logger.warning("Online translation failed, trying Argos fallback: %s", e)
-
-    if _ensure_translator():
-        try:
-            return _argos_translate(text, direction)
-        except Exception as e:
-            logger.warning("Argos translation failed, trying online: %s", e)
-
-    try:
-        return _online_translate_long(text, direction)
-    except Exception as e:
-        logger.error("Online translation error: %s", e)
-        raise RuntimeError(f"تعذرت الترجمة: {e}") from e
+    if _texts_match(translated, text) and _should_rescue(text, direction):
+        rescued = _rescue_term(text, direction)
+        if rescued:
+            translated = repair_copied(rescued, direction)
+    return translated
 
 
 def translate_units(text: str, direction: str = "en_ar") -> list[tuple[str, str]]:

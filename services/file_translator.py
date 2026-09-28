@@ -47,6 +47,16 @@ _WORD_BATCH_SIZE = 40
 def _clear_word_cache():
     _word_cache.clear()
 
+def _token_core(token: str) -> str:
+    return re.sub(r"^[^\w\u0600-\u06FF]+|[^\w\u0600-\u06FF]+$", "", (token or "").strip())
+
+
+def _same_token(left: str, right: str) -> bool:
+    a = _token_core(left).casefold()
+    b = _token_core(right).casefold()
+    return bool(a) and a == b
+
+
 def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
     """ترجمة الكلمات الفريدة دفعة واحدة — أسرع بكثير من كلمة/طلب."""
     direction = resolve_direction(text, direction)
@@ -54,10 +64,11 @@ def _prewarm_word_cache_for_text(text: str, direction: str) -> None:
     seen: set[str] = set()
     for unit in _extract_logical_units(text):
         for token in WORD_TOKEN_RE.findall(unit):
-            key = token.lower()
-            if key not in seen and WORD_CHAR_RE.search(token):
+            core = _token_core(token)
+            key = core.lower()
+            if key and key not in seen and WORD_CHAR_RE.search(core):
                 seen.add(key)
-                unique.append(token)
+                unique.append(core)
     if not unique:
         return
 
@@ -91,7 +102,7 @@ def translate_word(word: str, direction: str) -> str:
     raw = word.strip()
     if not raw or not WORD_CHAR_RE.search(raw):
         return word
-    core = re.sub(r"^[^\w\u0600-\u06FF]+|[^\w\u0600-\u06FF]+$", "", raw)
+    core = _token_core(raw)
     if not core:
         return word
     prefix = raw[: raw.index(core)] if core in raw else ""
@@ -124,22 +135,30 @@ def _apply_affixes(original: str, translated_core: str) -> str:
 
 
 def translate_word_in_context(token: str, line: str, direction: str) -> str:
-    """ترجمة أدق: تستخدم سياق الجملة عند تطابق عدد الكلمات"""
+    """ترجمة الكلمة. إذا رجعت كما هي نستخدم سياق الجملة بدل قبول النسخة."""
+    direct = translate_word(token, direction)
+    if not _same_token(direct, token):
+        return direct
+
     words = [w for w in WORD_TOKEN_RE.findall(line) if WORD_CHAR_RE.search(w)]
     if token not in words:
-        return translate_word(token, direction)
+        return direct
 
     idx = words.index(token)
-    for window in (1, 2, 3):
+    for window in (2, 3):
         start = max(0, idx - window + 1)
         end = min(len(words), idx + window)
         chunk_words = words[start:end]
+        if len(chunk_words) < 2:
+            continue
         chunk_tr = translate_text(" ".join(chunk_words), direction).strip()
         tr_tokens = [w for w in WORD_TOKEN_RE.findall(chunk_tr) if WORD_CHAR_RE.search(w)]
-        if len(tr_tokens) == len(chunk_words):
-            rel = idx - start
-            return _apply_affixes(token, tr_tokens[rel])
-    return translate_word(token, direction)
+        if len(tr_tokens) != len(chunk_words):
+            continue
+        candidate = tr_tokens[idx - start]
+        if not _same_token(candidate, chunk_words[idx - start]):
+            return _apply_affixes(token, candidate)
+    return direct
 
 
 def _extract_logical_units(text: str) -> list[str]:
@@ -171,6 +190,7 @@ def _format_word_pair(token: str, translation: str) -> str:
 def build_literal_sections(text: str, direction: str) -> list[tuple[str, list[tuple[str, str]]]]:
     """ترجمة حرفية مرتبة حسب الفقرات — الملف كاملاً"""
     direction = resolve_direction(text, direction)
+    _prewarm_word_cache_for_text(text, direction)
     sections: list[tuple[str, list[tuple[str, str]]]] = []
 
     for idx, unit in enumerate(_extract_logical_units(text), 1):
@@ -779,6 +799,7 @@ def _build_overlay_file(
     source_path: Path, out_dir: Path, stem: str, direction: str, content: str,
 ) -> dict[str, Path]:
     direction = resolve_direction(content, direction)
+    _prewarm_word_cache_for_text(content, direction)
     suffix = source_path.suffix.lower()
 
     if suffix in (".docx", ".doc"):
@@ -1133,6 +1154,7 @@ def _translate_image_overlay(
     import fitz
 
     direction = resolve_direction(content, direction)
+    _prewarm_word_cache_for_text(content, direction)
     fontfile = find_arabic_font()
     doc = fitz.open()
     page = doc.new_page(width=layout["width"], height=layout["height"])
