@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import re
 
+from services.glossary_cs import CS_ENTRIES
+from services.glossary_eng import ENG_ENTRIES
 from services.glossary_extra import EXTRA_ALIASES, EXTRA_ENTRIES, EXTRA_FORCE_SHORT
+from services.glossary_med import MED_ENTRIES
+from services.glossary_more import MORE_ENTRIES
+from services.glossary_sci import SCI_ENTRIES
 
 # كلمات تحتمل أكثر من معنى: تُترجم علمياً إذا كانت النص كله،
 # ولا تُفرض داخل الجملة حتى يبقى السياق للمحرك.
@@ -1141,7 +1146,9 @@ _AR_ALL: list[tuple[re.Pattern[str], str, str]] = []
 
 
 def _build() -> None:
-    all_entries = ENTRIES + EXTRA_ENTRIES
+    all_entries = (
+        ENTRIES + EXTRA_ENTRIES + MED_ENTRIES + ENG_ENTRIES + SCI_ENTRIES + CS_ENTRIES + MORE_ENTRIES
+    )
     ordered = sorted(all_entries, key=lambda item: (len(item[0]), item[0].count(" ")), reverse=True)
     for english, arabic in ordered:
         ek = _norm_en(english)
